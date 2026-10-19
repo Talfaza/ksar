@@ -1,3 +1,4 @@
 /ksar
 *.test
 *.out
+/build

@@ -40,11 +40,15 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-1. **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
+Status: stages 1-2 done.
+
+1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
-2. **Boot Linux** – x86 boot protocol (bzImage, boot_params/zero page, e820,
+2. ✅ **Boot Linux** – x86 boot protocol (bzImage, boot_params/zero page, e820,
    cmdline), GDT + page tables, CPUID passthrough, `KVM_CREATE_IRQCHIP`,
    `KVM_CREATE_PIT2`, 8250 UART on 0x3f8 for `console=ttyS0`.
+   Boots the host Fedora kernel to userspace in ~0.9 s. Devices: 16550A UART
+   (IRQ 4), CMOS RTC, i8042 stub (reboot = VM exit). No PCI/ACPI.
 3. **Agent in initramfs** – static Go agent + busybox, run commands.
 4. **virtio-mmio** – virtio-blk for a real rootfs, vhost-vsock for the agent channel.
 5. **Sandbox hardening** – bounds-check all guest data through one helper,
@@ -75,6 +79,13 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 - `golang.org/x/sys/unix` for ioctl/mmap; define KVM structs with exact C layouts.
 - Interrupt `KVM_RUN` with a signal + `immediate_exit` in `kvm_run`.
 - Careful with `unsafe.Pointer` into mmapped guest memory.
+
+## Guest kernel
+
+The host Fedora kernel boots fine for stages 1-3, but it builds
+`virtio-mmio` and vsock as modules. Stage 4 needs our own minimal kernel
+config with these built in (also: fewer drivers = smaller attack surface
+inside the guest and faster boot).
 
 ## Scope decisions
 

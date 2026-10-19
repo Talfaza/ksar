@@ -20,6 +20,10 @@ func TestStructSizes(t *testing.T) {
 		{"kvm_sregs", unsafe.Sizeof(Sregs{}), 312},
 		{"kvm_run header", unsafe.Sizeof(Run{}), runUnionOffset},
 		{"kvm_run.io", unsafe.Sizeof(ExitIODetails{}), 16},
+		{"kvm_run.mmio", unsafe.Sizeof(ExitMMIODetails{}), 24},
+		{"kvm_cpuid_entry2", unsafe.Sizeof(CPUIDEntry{}), 40},
+		{"kvm_fpu", unsafe.Sizeof(FPU{}), 416},
+		{"kvm_lapic_state", unsafe.Sizeof(LAPICState{}), 1024},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -50,6 +54,16 @@ func TestIoctlNumbers(t *testing.T) {
 		{"KVM_SET_REGS", kvmSetRegs, 0x4090AE82},
 		{"KVM_GET_SREGS", kvmGetSregs, 0x8138AE83},
 		{"KVM_SET_SREGS", kvmSetSregs, 0x4138AE84},
+		{"KVM_GET_SUPPORTED_CPUID", kvmGetSupportedCPUID, 0xC008AE05},
+		{"KVM_SET_TSS_ADDR", kvmSetTSSAddr, 0xAE47},
+		{"KVM_CREATE_IRQCHIP", kvmCreateIRQChip, 0xAE60},
+		{"KVM_IRQ_LINE", kvmIRQLine, 0x4008AE61},
+		{"KVM_CREATE_PIT2", kvmCreatePIT2, 0x4040AE77},
+		{"KVM_SET_FPU", kvmSetFPU, 0x41A0AE8D},
+		{"KVM_GET_LAPIC", kvmGetLAPIC, 0x8400AE8E},
+		{"KVM_SET_LAPIC", kvmSetLAPIC, 0x4400AE8F},
+		{"KVM_SET_CPUID2", kvmSetCPUID2, 0x4008AE90},
+		{"KVM_SET_MSRS", kvmSetMSRs, 0x4008AE89},
 	}
 	for _, c := range cases {
 		if c.got != c.want {

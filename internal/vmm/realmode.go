@@ -6,17 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"ksar/internal/guest"
 	"ksar/internal/kvm"
 )
-
-// ErrTimeout is returned when the guest did not finish before the deadline.
-var ErrTimeout = errors.New("guest timed out")
 
 // RealModeConfig describes a stage-1 run: a flat binary executed in 16-bit
 // real mode with no devices except a serial port and an exit port.
@@ -96,79 +90,31 @@ func RunRealMode(cfg RealModeConfig) (Result, error) {
 
 	out := &limitedWriter{w: cfg.Output, remaining: cfg.MaxOutput}
 	start := time.Now()
-	err = runLoop(vcpu, cfg.Timeout, out, &res)
+	res.Exits, err = runVCPU(vcpu, cfg.Timeout, func(vcpu *kvm.VCPU) (bool, error) {
+		switch vcpu.RunState().ExitReason {
+		case kvm.ExitIO:
+			return handleRealModeIO(vcpu, out, &res)
+		case kvm.ExitHLT:
+			res.Halted = true
+			return true, nil
+		case kvm.ExitShutdown:
+			return true, errors.New("guest shut down (triple fault)")
+		}
+		return true, fatalExit(vcpu)
+	})
 	res.Duration = time.Since(start)
 	res.OutputBytes, res.Truncated = out.written, out.truncated
 	return res, err
 }
 
-// runLoop enters the guest repeatedly and handles each exit. It owns the
-// calling OS thread for its whole duration: KVM requires every KVM_RUN on a
-// vCPU to come from the same thread, and the timeout signal targets it.
-func runLoop(vcpu *kvm.VCPU, timeout time.Duration, out *limitedWriter, res *Result) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	run := vcpu.RunState()
-	var expired atomic.Bool
-	if timeout > 0 {
-		pid, tid := syscall.Getpid(), syscall.Gettid()
-		timer := time.AfterFunc(timeout, func() {
-			expired.Store(true)
-			// ImmediateExit covers the race where the signal lands just
-			// before KVM_RUN starts; the signal kicks a vCPU already inside
-			// the guest. SIGURG is harmless to the Go runtime (it uses it
-			// for preemption itself).
-			run.ImmediateExit = 1
-			syscall.Tgkill(pid, tid, syscall.SIGURG)
-		})
-		defer timer.Stop()
-	}
-
-	for {
-		err := vcpu.Run()
-		if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) {
-			if expired.Load() {
-				return ErrTimeout
-			}
-			continue // spurious interruption (e.g. Go runtime preemption)
-		}
-		if err != nil {
-			return fmt.Errorf("KVM_RUN: %w", err)
-		}
-		res.Exits++
-
-		switch run.ExitReason {
-		case kvm.ExitIO:
-			done, err := handleIO(vcpu, out, res)
-			if err != nil || done {
-				return err
-			}
-		case kvm.ExitHLT:
-			res.Halted = true
-			return nil
-		case kvm.ExitShutdown:
-			return errors.New("guest shut down (triple fault)")
-		case kvm.ExitFailEntry:
-			return fmt.Errorf("vm entry failed: hardware reason %#x",
-				vcpu.FailEntry().HardwareEntryFailureReason)
-		case kvm.ExitInternalError:
-			return fmt.Errorf("kvm internal error: suberror %d",
-				vcpu.InternalError().Suberror)
-		default:
-			return fmt.Errorf("unhandled exit reason %d", run.ExitReason)
-		}
-	}
-}
-
-// handleIO emulates port I/O. It reports done=true when the guest asked to
-// exit. Unknown ports behave like empty hardware: writes are dropped and
-// reads return 0xff.
-func handleIO(vcpu *kvm.VCPU, out *limitedWriter, res *Result) (done bool, err error) {
+// handleRealModeIO emulates the two stage-1 ports. It reports done=true
+// when the guest asked to exit. Unknown ports behave like empty hardware:
+// writes are dropped and reads return 0xff.
+func handleRealModeIO(vcpu *kvm.VCPU, out *limitedWriter, res *Result) (done bool, err error) {
 	d := vcpu.IO()
 	data, err := vcpu.IOData()
 	if err != nil {
-		return false, err
+		return true, err
 	}
 	if d.Direction == kvm.IODirIn {
 		for i := range data {
@@ -181,7 +127,7 @@ func handleIO(vcpu *kvm.VCPU, out *limitedWriter, res *Result) (done bool, err e
 		// Size is 1 for byte OUTs; with Count > 1 (rep outsb) data holds
 		// every byte in order.
 		if _, err := out.Write(data); err != nil {
-			return false, fmt.Errorf("write serial output: %w", err)
+			return true, fmt.Errorf("write serial output: %w", err)
 		}
 	case guest.ExitPort:
 		if len(data) > 0 {
@@ -190,30 +136,4 @@ func handleIO(vcpu *kvm.VCPU, out *limitedWriter, res *Result) (done bool, err e
 		return true, nil
 	}
 	return false, nil
-}
-
-// limitedWriter forwards at most remaining bytes, then silently drops the
-// rest, so a guest cannot flood the host with output.
-type limitedWriter struct {
-	w         io.Writer
-	remaining int64
-	written   int64
-	truncated bool
-}
-
-func (l *limitedWriter) Write(p []byte) (int, error) {
-	n := len(p)
-	if int64(len(p)) > l.remaining {
-		p = p[:l.remaining]
-		l.truncated = true
-	}
-	if len(p) > 0 {
-		m, err := l.w.Write(p)
-		l.remaining -= int64(m)
-		l.written += int64(m)
-		if err != nil {
-			return m, err
-		}
-	}
-	return n, nil
 }
