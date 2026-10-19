@@ -66,13 +66,19 @@ type Serial struct {
 	irqHigh                 bool
 	rx                      []byte
 	err                     error
+	rxSpace                 chan struct{} // signaled when the guest consumes input
 }
 
 // NewSerial returns a UART writing guest output to out and raising
 // interrupts through irq.
 func NewSerial(out io.Writer, irq func(high bool)) *Serial {
-	return &Serial{out: out, irq: irq, dll: 12} // 9600 baud, as after reset
+	return &Serial{out: out, irq: irq, dll: 12, // 9600 baud, as after reset
+		rxSpace: make(chan struct{}, 1)}
 }
+
+// RxSpace returns a channel that receives a value whenever the guest has
+// read input, i.e. when Receive may accept more bytes.
+func (s *Serial) RxSpace() <-chan struct{} { return s.rxSpace }
 
 // Err returns the first error writing guest output, if any.
 func (s *Serial) Err() error {
@@ -81,17 +87,22 @@ func (s *Serial) Err() error {
 	return s.err
 }
 
-// Receive queues bytes for the guest to read (e.g. host keyboard input).
-// Bytes beyond the receive buffer are dropped. Safe for concurrent use.
-func (s *Serial) Receive(p []byte) {
+// Receive queues bytes for the guest to read and returns how many fit in
+// the receive buffer. Callers wanting to send more wait on RxSpace.
+// Safe for concurrent use.
+func (s *Serial) Receive(p []byte) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	room := rxBufSize - len(s.rx)
 	if len(p) > room {
 		p = p[:room]
 	}
+	if len(p) == 0 {
+		return 0
+	}
 	s.rx = append(s.rx, p...)
 	s.updateIRQ()
+	return len(p)
 }
 
 // Read handles a guest IN from base+offset.
@@ -107,6 +118,10 @@ func (s *Serial) Read(offset uint16, data []byte) {
 			v = s.rx[0]
 			s.rx = s.rx[1:]
 			s.updateIRQ()
+			select {
+			case s.rxSpace <- struct{}{}:
+			default:
+			}
 		}
 	case uartIER:
 		if s.lcr&lcrDLAB != 0 {

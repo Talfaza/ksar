@@ -40,7 +40,7 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-Status: stages 1-2 done.
+Status: stages 1-3 done.
 
 1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
@@ -49,7 +49,13 @@ Status: stages 1-2 done.
    `KVM_CREATE_PIT2`, 8250 UART on 0x3f8 for `console=ttyS0`.
    Boots the host Fedora kernel to userspace in ~0.9 s. Devices: 16550A UART
    (IRQ 4), CMOS RTC, i8042 stub (reboot = VM exit). No PCI/ACPI.
-3. **Agent in initramfs** – static Go agent + busybox, run commands.
+3. ✅ **Agent in initramfs** – static Go agent + busybox, run commands.
+   `ksar run -image alpine.tar -- CMD`: Docker export tar -> initramfs,
+   agent as PID 1 on COM2 with a credit-flow-controlled framed protocol,
+   files in, stdin/stdout/stderr streamed, exit codes like docker (124
+   timeout, 125 ksar error, 127 not found, 128+N signal). ~0.8 s boot+run.
+   Known limit: serial I/O is ~110-140 KB/s (a VM exit per byte); fixed by
+   vsock in stage 4. Images unpack into RAM (size them with -mem).
 4. **virtio-mmio** – virtio-blk for a real rootfs, vhost-vsock for the agent channel.
 5. **Sandbox hardening** – bounds-check all guest data through one helper,
    seccomp after setup, unprivileged user, cgroups, timeouts, fuzzing.

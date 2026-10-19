@@ -83,8 +83,20 @@ func TestSerialReceive(t *testing.T) {
 	if in(s, uartLSR)&lsrDR != 0 {
 		t.Fatal("LSR.DR still set after draining")
 	}
-	s.Receive(make([]byte, rxBufSize+100))
-	if len(s.rx) != rxBufSize {
-		t.Fatalf("rx buffer grew to %d", len(s.rx))
+	if n := s.Receive(make([]byte, rxBufSize+100)); n != rxBufSize {
+		t.Fatalf("Receive accepted %d bytes, want %d", n, rxBufSize)
+	}
+	if n := s.Receive([]byte("x")); n != 0 {
+		t.Fatalf("Receive into a full buffer accepted %d bytes", n)
+	}
+	select { // discard the signal left by the earlier reads
+	case <-s.RxSpace():
+	default:
+	}
+	in(s, uartRBR)
+	select {
+	case <-s.RxSpace():
+	default:
+		t.Fatal("no RxSpace signal after the guest read a byte")
 	}
 }

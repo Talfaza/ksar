@@ -20,6 +20,7 @@ import (
 const usage = `ksar - run untrusted code in KVM microVMs
 
 Usage:
+  ksar run [flags] -- CMD [ARGS...]  run a command in a throwaway microVM
   ksar boot [flags]                  boot a Linux kernel in a microVM (stage 2)
   ksar initramfs -init FILE -o OUT   build a minimal initramfs around an init binary
   ksar hello [-timeout 5s] [-spin]   run a tiny real-mode guest (stage 1)
@@ -35,6 +36,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "run":
+		os.Exit(cmdRun(os.Args[2:]))
 	case "boot":
 		err = cmdBoot(os.Args[2:])
 	case "initramfs":
