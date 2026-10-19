@@ -40,7 +40,7 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-Status: stages 1-3 done.
+Status: stages 1-4 done.
 
 1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
@@ -56,7 +56,15 @@ Status: stages 1-3 done.
    timeout, 125 ksar error, 127 not found, 128+N signal). ~0.8 s boot+run.
    Known limit: serial I/O is ~110-140 KB/s (a VM exit per byte); fixed by
    vsock in stage 4. Images unpack into RAM (size them with -mem).
-4. **virtio-mmio** – virtio-blk for a real rootfs, vhost-vsock for the agent channel.
+4. ✅ **virtio-mmio** – virtio-blk for a real rootfs, vhost-vsock for the agent channel.
+   Own kernel (Linux 6.18 LTS, tinyconfig + kernel/ksar.config, 2.2 MB,
+   userspace in ~0.13 s). virtio-mmio transport, virtio-blk (userspace),
+   vhost-vsock (kernel data path; host listens, only our CID accepted).
+   Images: Docker tar -> EROFS via mkfs.erofs --tar (cached in
+   ~/.cache/ksar/images), mounted read-only under a tmpfs overlay; agent
+   switches root and is invisible to the guest. Boot+run ~0.43 s; stdin
+   ~50 MB/s+; Alpine/Debian/Ubuntu/Fedora/Arch all run in 256 MB.
+   Legacy mode (serial + initramfs) remains for non-Ksar kernels.
 5. **Sandbox hardening** – bounds-check all guest data through one helper,
    seccomp after setup, unprivileged user, cgroups, timeouts, fuzzing.
 6. **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
@@ -88,10 +96,13 @@ Status: stages 1-3 done.
 
 ## Guest kernel
 
-The host Fedora kernel boots fine for stages 1-3, but it builds
-`virtio-mmio` and vsock as modules. Stage 4 needs our own minimal kernel
-config with these built in (also: fewer drivers = smaller attack surface
-inside the guest and faster boot).
+`make kernel` builds Linux LTS from `kernel/ksar.config` on top of
+tinyconfig: no PCI/ACPI/USB/modules, virtio-mmio + blk + vsock, EROFS,
+overlayfs. The build fails if any requested option gets dropped. Version
+suffix `-ksar` lets `ksar run` detect it and pick virtio mode.
+
+Next for the kernel: virtio-rng (entropy), and KVM_IOEVENTFD/IRQFD to skip
+VMM round trips on queue kicks.
 
 ## Scope decisions
 

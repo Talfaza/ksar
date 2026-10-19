@@ -1,22 +1,31 @@
 // Command ksar-agent runs as PID 1 inside a Ksar microVM. It prepares the
-// guest system, then serves the host over a dedicated serial port
-// (/dev/ttyS1): receiving files, running commands and streaming their
-// output back.
+// guest system, then serves the host: receiving files, running commands
+// and streaming their output back.
+//
+// It reads its instructions from the kernel command line:
+//
+//	ksar.root=/dev/vda   mount this read-only image (EROFS) under a RAM
+//	                     overlay and switch into it
+//	ksar.vsock=PORT      talk to the host over vsock (CID 2, PORT); without
+//	                     it, fall back to the serial port /dev/ttyS1
 //
 // It must be a static binary: CGO_ENABLED=0 go build ./cmd/ksar-agent
 package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"ksar/internal/agent/proto"
@@ -46,20 +55,134 @@ func main() {
 		k, v, _ := strings.Cut(kv, "=")
 		os.Setenv(k, v)
 	}
+	args := kernelArgs()
+	if root := args["ksar.root"]; root != "" {
+		if err := switchRoot(root, args["ksar.rootfstype"]); err != nil {
+			fatal("switch to root %s: %v", root, err)
+		}
+	}
 	setupSystem()
 
-	tty, err := os.OpenFile(channelDevice, os.O_RDWR|syscall.O_NOCTTY, 0)
+	conn, err := openChannel(args)
 	if err != nil {
-		fatal("open %s: %v", channelDevice, err)
+		fatal("%v", err)
 	}
-	if err := makeRaw(int(tty.Fd())); err != nil {
-		fatal("raw mode on %s: %v", channelDevice, err)
-	}
-	a := &agent{in: tty, out: proto.NewWriter(tty)}
+	a := &agent{in: conn, out: proto.NewWriter(conn)}
 	if err := a.serve(); err != nil {
 		fatal("%v", err)
 	}
 	fatal("host channel closed")
+}
+
+// kernelArgs parses key=value words from /proc/cmdline.
+func kernelArgs() map[string]string {
+	os.MkdirAll("/proc", 0o555)
+	syscall.Mount("proc", "/proc", "proc", 0, "") // may already be mounted
+	b, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		fatal("read /proc/cmdline: %v", err)
+	}
+	args := map[string]string{}
+	for _, w := range strings.Fields(string(b)) {
+		k, v, _ := strings.Cut(w, "=")
+		args[k] = v
+	}
+	return args
+}
+
+// switchRoot mounts the image read-only, stacks a RAM-backed writable
+// layer on it with overlayfs, and makes that the root. Writes never reach
+// the image, so one image file serves many runs, each starting clean.
+func switchRoot(dev, fstype string) error {
+	if fstype == "" {
+		fstype = "erofs"
+	}
+	os.MkdirAll("/dev", 0o755)
+	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755"); err != nil &&
+		!errors.Is(err, syscall.EBUSY) {
+		return fmt.Errorf("mount /dev: %w", err)
+	}
+	for _, d := range []string{"/.ksar/lower", "/.ksar/rw", "/.ksar/root"} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := syscall.Mount(dev, "/.ksar/lower", fstype, syscall.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("mount %s (%s): %w", dev, fstype, err)
+	}
+	if err := syscall.Mount("tmpfs", "/.ksar/rw", "tmpfs", 0, "mode=0755"); err != nil {
+		return fmt.Errorf("mount writable layer: %w", err)
+	}
+	for _, d := range []string{"/.ksar/rw/upper", "/.ksar/rw/work"} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := syscall.Mount("overlay", "/.ksar/root", "overlay", 0,
+		"lowerdir=/.ksar/lower,upperdir=/.ksar/rw/upper,workdir=/.ksar/rw/work"); err != nil {
+		return fmt.Errorf("mount overlay: %w", err)
+	}
+	// Detach the initramfs's /proc and /dev; setupSystem mounts fresh ones
+	// inside the new root.
+	syscall.Unmount("/proc", syscall.MNT_DETACH)
+	syscall.Unmount("/dev", syscall.MNT_DETACH)
+
+	// Same dance as switch_root(8): move the new root over / and chroot.
+	if err := os.Chdir("/.ksar/root"); err != nil {
+		return err
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move root: %w", err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		return fmt.Errorf("chroot: %w", err)
+	}
+	return os.Chdir("/")
+}
+
+// openChannel connects to the host over vsock if the host offered it,
+// otherwise opens the serial fallback.
+func openChannel(args map[string]string) (io.ReadWriter, error) {
+	if p := args["ksar.vsock"]; p != "" {
+		port, err := strconv.ParseUint(p, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("bad ksar.vsock=%q", p)
+		}
+		return dialHost(uint32(port))
+	}
+	tty, err := os.OpenFile(channelDevice, os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", channelDevice, err)
+	}
+	if err := makeRaw(int(tty.Fd())); err != nil {
+		return nil, fmt.Errorf("raw mode on %s: %w", channelDevice, err)
+	}
+	return tty, nil
+}
+
+// dialHost connects to the host (vsock CID 2) on port, retrying briefly
+// in case the virtio driver is still coming up.
+func dialHost(port uint32) (*os.File, error) {
+	const afVsock, cidHost = 40, 2
+	var sa [16]byte
+	sa[0] = afVsock
+	binary.LittleEndian.PutUint32(sa[4:], port)
+	binary.LittleEndian.PutUint32(sa[8:], cidHost)
+	var lastErr error
+	for range 200 {
+		fd, err := syscall.Socket(afVsock, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return nil, fmt.Errorf("vsock socket: %w", err)
+		}
+		_, _, e := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&sa)), uintptr(len(sa)))
+		if e == 0 {
+			return os.NewFile(uintptr(fd), "vsock-host"), nil
+		}
+		syscall.Close(fd)
+		lastErr = e
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("connect to host vsock port %d: %w", port, lastErr)
 }
 
 // setupSystem mounts the usual pseudo filesystems and brings up loopback

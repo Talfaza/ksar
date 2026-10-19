@@ -3,16 +3,19 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"ksar/internal/agent/proto"
 	"ksar/internal/agentbin"
+	imagecache "ksar/internal/image"
 	"ksar/internal/sandbox"
 )
 
@@ -42,7 +45,8 @@ Flags:
 `)
 		fs.PrintDefaults()
 	}
-	kernel := fs.String("kernel", defaultKernel(), "bzImage to boot")
+	kernel := fs.String("kernel", findKernel(), "bzImage to boot (default: the Ksar kernel if built, else the host's)")
+	legacy := fs.Bool("legacy", false, "use the serial channel and an in-RAM image even with a Ksar kernel")
 	image := fs.String("image", "", "root filesystem tar, e.g. from `docker export` (default: agent only)")
 	mem := fs.String("mem", "256M", "guest memory")
 	timeout := fs.Duration("timeout", 60*time.Second, "kill the VM after this long (0 = never)")
@@ -91,7 +95,9 @@ Flags:
 		return fail(err)
 	}
 
+	virtioMode := isKsarKernel(kernelData) && !*legacy
 	opts := sandbox.Options{
+		Virtio:  virtioMode,
 		Kernel:  kernelData,
 		Agent:   agentData,
 		MemSize: int(memSize),
@@ -101,16 +107,27 @@ Flags:
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 	}
-	if *image != "" {
+	if *image != "" && virtioMode {
+		start := time.Now()
+		disk, err := imagecache.FromTar(*image)
+		if err != nil {
+			return fail(err)
+		}
+		opts.RootDisk = disk
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[ksar] image %s ready in %v\n", disk, time.Since(start).Round(time.Millisecond))
+		}
+	} else if *image != "" {
 		f, err := os.Open(*image)
 		if err != nil {
 			return fail(err)
 		}
 		defer f.Close()
 		opts.Image = bufio.NewReaderSize(f, 1<<20)
-		if st, err := f.Stat(); err == nil && st.Size() > memSize/2 {
-			fmt.Fprintf(os.Stderr, "ksar: warning: image is %d MiB but the VM has %d MiB of RAM; "+
-				"the image is unpacked into RAM, consider a larger -mem\n", st.Size()>>20, memSize>>20)
+		// Legacy mode holds the archive and its unpacked copy in RAM at once.
+		if st, err := f.Stat(); err == nil && st.Size()*5/2+128<<20 > memSize {
+			fmt.Fprintf(os.Stderr, "ksar: warning: legacy mode unpacks the %d MiB image into RAM; "+
+				"-mem %dM or more is recommended\n", st.Size()>>20, (st.Size()*5/2+128<<20)>>20)
 		}
 	}
 	if *interactive {
@@ -122,7 +139,11 @@ Flags:
 
 	res, err := sandbox.Run(opts)
 	if *verbose {
-		fmt.Fprintf(os.Stderr, "[ksar] boot %v, total %v, VM: %s\n",
+		mode := "legacy (serial)"
+		if virtioMode {
+			mode = "virtio (vsock)"
+		}
+		fmt.Fprintf(os.Stderr, "[ksar] %s: boot %v, total %v, VM: %s\n", mode,
 			res.Boot.Round(time.Millisecond), res.Total.Round(time.Millisecond), res.VM.Reason)
 	}
 	if errors.Is(err, sandbox.ErrTimeout) {
@@ -182,4 +203,44 @@ func showTail(tail []byte) {
 	for _, l := range lines {
 		fmt.Fprintln(os.Stderr, "  | "+strings.TrimRight(l, "\r"))
 	}
+}
+
+// findKernel picks the default kernel: the Ksar guest kernel if one is
+// built or installed, otherwise the running host kernel.
+func findKernel() string {
+	candidates := []string{os.Getenv("KSAR_KERNEL")}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "build", "bzImage"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".local", "share", "ksar", "bzImage"))
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if st, err := os.Stat(c); err == nil && st.Mode().IsRegular() {
+			return c
+		}
+	}
+	return defaultKernel()
+}
+
+// isKsarKernel reports whether a bzImage is the Ksar guest kernel, by its
+// version string (CONFIG_LOCALVERSION="-ksar"). The setup header stores a
+// pointer to that string at 0x20e, relative to 0x200.
+func isKsarKernel(k []byte) bool {
+	if len(k) < 0x210 || string(k[0x202:0x206]) != "HdrS" {
+		return false
+	}
+	off := 0x200 + int(binary.LittleEndian.Uint16(k[0x20e:]))
+	if off >= len(k) {
+		return false
+	}
+	end := bytes.IndexByte(k[off:min(len(k), off+256)], 0)
+	if end < 0 {
+		return false
+	}
+	version, _, _ := strings.Cut(string(k[off:off+end]), " ")
+	return strings.HasSuffix(version, "-ksar")
 }

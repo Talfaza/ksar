@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"ksar/internal/agent"
@@ -28,10 +29,19 @@ type File struct {
 
 // Options configures a sandboxed run.
 type Options struct {
-	Kernel  []byte    // bzImage
-	Agent   []byte    // static ksar-agent binary
-	Image   io.Reader // optional root filesystem as a tar (e.g. docker export)
-	MemSize int       // guest RAM in bytes (default 256 MiB)
+	Kernel  []byte // bzImage
+	Agent   []byte // static ksar-agent binary
+	MemSize int    // guest RAM in bytes (default 256 MiB)
+
+	// Virtio selects the fast path: the agent talks over vsock and the
+	// root filesystem is RootDisk (a read-only EROFS image, see package
+	// image) under a RAM overlay. It needs the Ksar guest kernel.
+	// Without Virtio, the agent uses a serial port and Image (a tar) is
+	// unpacked into the initramfs, which works with any kernel.
+	Virtio   bool
+	RootDisk string    // Virtio: EROFS image path (optional: agent only)
+	Image    io.Reader // legacy: root filesystem tar (optional)
+
 	Timeout time.Duration
 	Console io.Writer // if set, the guest kernel log is shown here (verbose)
 
@@ -67,28 +77,42 @@ func Run(opts Options) (Result, error) {
 		opts.Stderr = io.Discard
 	}
 
-	rd, err := buildInitramfs(opts.Agent, opts.Image)
-	if err != nil {
+	cfg := vmm.LinuxConfig{
+		Kernel:  opts.Kernel,
+		Cmdline: vmm.DefaultCmdline + " rdinit=/" + agentPath,
+		MemSize: opts.MemSize,
+		Timeout: opts.Timeout,
+		Output:  opts.Console,
+	}
+	if opts.Console == nil {
+		cfg.Cmdline += " quiet"
+	}
+	tarball := opts.Image
+	if opts.Virtio {
+		tarball = nil
+		cfg.Vsock = true
+		if opts.RootDisk != "" {
+			cfg.Disks = []vmm.Disk{{Path: opts.RootDisk, ReadOnly: true}}
+			cfg.Cmdline += " ksar.root=/dev/vda"
+		}
+	} else {
+		cfg.AgentChannel = true
+	}
+	var err error
+	if cfg.Initrd, err = buildInitramfs(opts.Agent, tarball); err != nil {
 		return res, err
 	}
-
-	cmdline := vmm.DefaultCmdline + " rdinit=/" + agentPath
-	if opts.Console == nil {
-		cmdline += " quiet"
-	}
-	m, err := vmm.NewLinux(vmm.LinuxConfig{
-		Kernel:       opts.Kernel,
-		Initrd:       rd,
-		Cmdline:      cmdline,
-		MemSize:      opts.MemSize,
-		Timeout:      opts.Timeout,
-		Output:       opts.Console,
-		AgentChannel: true,
-	})
+	m, err := vmm.NewLinux(cfg)
 	if err != nil {
 		return res, err
 	}
 	defer m.Close()
+
+	// The vsock connection must be closed once the VM stops, or a session
+	// blocked reading from a dead guest would never return.
+	var connMu sync.Mutex
+	var conn io.Closer
+	vmStopped := false
 
 	// The session runs alongside the vCPU. Whichever ends first ends the
 	// other: the session stops the VM when done, and a VM that stops
@@ -101,16 +125,45 @@ func Run(opts Options) (Result, error) {
 	done := make(chan sessionResult, 1)
 	go func() {
 		var s sessionResult
-		s.exit, s.boot, s.err = session(m.Channel(), opts, start)
-		m.Stop()
-		done <- s
+		defer func() { m.Stop(); done <- s }()
+		var ch io.ReadWriter = m.Channel()
+		if opts.Virtio {
+			c, err := m.AgentConn()
+			if err != nil {
+				s.err = fmt.Errorf("waiting for agent: %w", err)
+				return
+			}
+			connMu.Lock()
+			conn = c
+			stopped := vmStopped
+			connMu.Unlock()
+			if stopped {
+				c.Close()
+			}
+			ch = c
+		}
+		s.exit, s.boot, s.err = session(ch, opts, start)
 	}()
 
 	vmRes, vmErr := m.Run()
+	connMu.Lock()
+	vmStopped = true
+	if conn != nil {
+		conn.Close()
+	}
+	connMu.Unlock()
 	s := <-done
 	res.VM, res.Exit, res.Boot = vmRes, s.exit, s.boot
 	res.Total = time.Since(start)
 	res.ConsoleTail = m.ConsoleTail()
+
+	// The kernel keeps booting after a failed initramfs unpack (usually
+	// out of RAM), leaving a partial filesystem. Never report results from
+	// such a guest as if it were healthy.
+	if bytes.Contains(res.ConsoleTail, []byte("Initramfs unpacking failed")) {
+		return res, errors.New("the guest ran out of memory unpacking the image into RAM; " +
+			"increase -mem (legacy mode needs about 2.5x the image size)")
+	}
 
 	switch {
 	case vmErr != nil:

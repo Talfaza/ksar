@@ -10,6 +10,7 @@ import (
 	"ksar/internal/boot"
 	"ksar/internal/devices"
 	"ksar/internal/kvm"
+	"ksar/internal/virtio"
 )
 
 // DefaultCmdline is the kernel command line used when none is given.
@@ -30,6 +31,21 @@ const tssAddr = 0xfffbd000
 // reports.
 const consoleTailSize = 64 << 10
 
+// virtio-mmio devices live above guest RAM (capped at 3 GiB) and below
+// the TSS region, one 4 KiB window each.
+const mmioBase = 0xd0000000
+
+// mmioIRQs are the legacy PIC lines given to virtio devices, avoiding the
+// timer (0), keyboard (1), cascade (2), COM2/COM1 (3/4), RTC (8) and
+// FPU (13).
+var mmioIRQs = []uint32{5, 6, 7, 9, 10, 11, 12, 14, 15}
+
+// Disk is a virtio-blk disk backed by a host file.
+type Disk struct {
+	Path     string
+	ReadOnly bool
+}
+
 // LinuxConfig describes a Linux microVM.
 type LinuxConfig struct {
 	Kernel       []byte // bzImage
@@ -41,6 +57,8 @@ type LinuxConfig struct {
 	MaxOutput    int64     // cap on console bytes forwarded to Output (default 16 MiB)
 	Trace        io.Writer // if set, unhandled port/MMIO accesses are logged
 	AgentChannel bool      // add COM2 as a byte stream to the guest agent
+	Disks        []Disk    // virtio-blk disks: /dev/vda, /dev/vdb, ... in order
+	Vsock        bool      // add a vhost-vsock device for the agent
 }
 
 // LinuxResult reports how a Linux guest run ended.
@@ -66,10 +84,21 @@ type Machine struct {
 	tail    *tailBuffer
 	channel *Channel
 
+	mmio   []mmioDevice
+	blocks []*virtio.Block
+	vsock  *virtio.Vsock
+	agentL *agentListener
+	done   chan struct{} // closed when Run returns
+
 	irqMu  sync.Mutex
 	irqErr error
 	reset  bool // guest requested a reboot (vCPU thread only)
 	ran    bool
+}
+
+type mmioDevice struct {
+	base uint64
+	dev  *virtio.MMIO
 }
 
 // NewLinux creates the VM, loads the kernel and wires up devices. Nothing
@@ -91,7 +120,7 @@ func NewLinux(cfg LinuxConfig) (m *Machine, err error) {
 		return nil, errors.New("memory size must be a multiple of 4 KiB")
 	}
 
-	m = &Machine{cfg: cfg}
+	m = &Machine{cfg: cfg, done: make(chan struct{})}
 	defer func() {
 		if err != nil {
 			m.Close()
@@ -119,7 +148,11 @@ func NewLinux(cfg LinuxConfig) (m *Machine, err error) {
 	if err != nil {
 		return nil, err
 	}
-	entry, err := boot.Load(mem, boot.Linux{Kernel: cfg.Kernel, Initrd: cfg.Initrd, Cmdline: cfg.Cmdline})
+	cmdline, err := m.addVirtio(virtio.NewMemory(mem))
+	if err != nil {
+		return nil, err
+	}
+	entry, err := boot.Load(mem, boot.Linux{Kernel: cfg.Kernel, Initrd: cfg.Initrd, Cmdline: cmdline})
 	if err != nil {
 		return nil, fmt.Errorf("load kernel: %w", err)
 	}
@@ -163,6 +196,57 @@ func NewLinux(cfg LinuxConfig) (m *Machine, err error) {
 		}
 	}
 	return m, nil
+}
+
+// addVirtio creates the configured virtio devices and returns the kernel
+// command line extended with their locations.
+func (m *Machine) addVirtio(mem *virtio.Memory) (string, error) {
+	cmdline := m.cfg.Cmdline
+	add := func(dev virtio.Device) error {
+		i := len(m.mmio)
+		if i >= len(mmioIRQs) {
+			return errors.New("too many virtio devices")
+		}
+		base := uint64(mmioBase + i*virtio.MMIOSize)
+		irq := mmioIRQs[i]
+		m.mmio = append(m.mmio, mmioDevice{base, virtio.NewMMIO(dev, mem, m.irqLine(irq), m.cfg.Trace)})
+		cmdline += fmt.Sprintf(" virtio_mmio.device=4K@%#x:%d", base, irq)
+		return nil
+	}
+	for i, d := range m.cfg.Disks {
+		b, err := virtio.NewBlock(d.Path, d.ReadOnly, fmt.Sprintf("ksar-disk%d", i))
+		if err != nil {
+			return "", err
+		}
+		m.blocks = append(m.blocks, b)
+		if err := add(b); err != nil {
+			return "", err
+		}
+	}
+	if m.cfg.Vsock {
+		v, err := virtio.NewVsock()
+		if err != nil {
+			return "", err
+		}
+		m.vsock = v
+		if m.agentL, err = listenAgent(v.CID()); err != nil {
+			return "", err
+		}
+		if err := add(v); err != nil {
+			return "", err
+		}
+		cmdline += fmt.Sprintf(" ksar.vsock=%d", m.agentL.port)
+	}
+	return cmdline, nil
+}
+
+// AgentConn waits for the guest agent to connect over vsock. It fails if
+// the VM stops first. Requires Vsock.
+func (m *Machine) AgentConn() (io.ReadWriteCloser, error) {
+	if m.agentL == nil {
+		return nil, errors.New("machine has no vsock device")
+	}
+	return m.agentL.accept(m.done)
 }
 
 // irqLine returns a callback that drives a legacy interrupt line. It may
@@ -215,6 +299,7 @@ func (m *Machine) Run() (LinuxResult, error) {
 	if m.channel != nil {
 		m.channel.close(io.EOF)
 	}
+	close(m.done)
 	return res, err
 }
 
@@ -244,8 +329,22 @@ func (m *Machine) handleExit(res *LinuxResult) exitHandler {
 			}
 			return false, nil
 		case kvm.ExitMMIO:
-			// No MMIO devices yet: reads see all ones, writes are dropped.
 			mm := vcpu.MMIO()
+			if mm.Len > uint32(len(mm.Data)) {
+				return true, fmt.Errorf("mmio access of %d bytes", mm.Len)
+			}
+			data := mm.Data[:mm.Len]
+			for _, d := range m.mmio {
+				if mm.PhysAddr >= d.base && mm.PhysAddr-d.base < virtio.MMIOSize {
+					if mm.IsWrite != 0 {
+						d.dev.Write(mm.PhysAddr-d.base, data)
+					} else {
+						d.dev.Read(mm.PhysAddr-d.base, data)
+					}
+					return false, nil
+				}
+			}
+			// Nothing mapped here: reads see all ones, writes are dropped.
 			if mm.IsWrite == 0 {
 				for i := range mm.Data {
 					mm.Data[i] = 0xff
@@ -279,6 +378,18 @@ func (m *Machine) Close() error {
 		m.channel.close(io.EOF)
 	}
 	var errs []error
+	if m.agentL != nil {
+		errs = append(errs, m.agentL.close())
+		m.agentL = nil
+	}
+	if m.vsock != nil {
+		errs = append(errs, m.vsock.Close())
+		m.vsock = nil
+	}
+	for _, b := range m.blocks {
+		errs = append(errs, b.Close())
+	}
+	m.blocks = nil
 	if m.vm != nil {
 		errs = append(errs, m.vm.Close())
 	}
