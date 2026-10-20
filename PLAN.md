@@ -40,7 +40,7 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-Status: stages 1-4 done.
+Status: stages 1-5 done.
 
 1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
@@ -65,8 +65,21 @@ Status: stages 1-4 done.
    switches root and is invisible to the guest. Boot+run ~0.43 s; stdin
    ~50 MB/s+; Alpine/Debian/Ubuntu/Fedora/Arch all run in 256 MB.
    Legacy mode (serial + initramfs) remains for non-Ksar kernels.
-5. **Sandbox hardening** – bounds-check all guest data through one helper,
+5. ✅ **Sandbox hardening** – bounds-check all guest data through one helper,
    seccomp after setup, unprivileged user, cgroups, timeouts, fuzzing.
+   - Fuzzing (`make fuzz`): virtqueues, virtio-blk, MMIO transport, UART,
+     port bus, agent frames, tar import, kernel loader. Guard region after
+     guest RAM catches out-of-bounds writes.
+   - Lockdown before the guest runs: seccomp allowlist on every thread
+     (TSYNC) with argument checks (KVM_RUN/IRQ_LINE/vhost ioctls only,
+     clone = threads only, no PROT_EXEC), no_new_privs, non-dumpable (no
+     ptrace or /proc/PID/mem by other processes), no core dumps. Refuses
+     root. ksar is static Go (cgo builds refuse lockdown).
+   - Cgroups via a systemd user scope: memory = guest + 256 MiB, no swap,
+     256 tasks, 150% CPU (auto; falls back without systemd).
+   - Not done: Landlock (per-thread, can't cover Go's existing threads),
+     namespaces (would need a separate VMM process); sanitizing terminal
+     escape sequences in guest output.
 6. **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
 7. **Optional devices** – networking, then display (framebuffer + VNC/noVNC).
 8. **Snapshots** – save/restore memory + vCPU state for fast starts

@@ -3,7 +3,7 @@
 GO ?= go
 AGENT := internal/agentbin/bin/ksar-agent
 
-.PHONY: all ksar agent kernel hello-initramfs boot alpine test clean distclean
+.PHONY: all ksar agent kernel hello-initramfs boot alpine test fuzz clean distclean
 
 all: ksar hello-initramfs
 
@@ -11,8 +11,9 @@ all: ksar hello-initramfs
 agent:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags='-s -w' -o $(AGENT) ./cmd/ksar-agent
 
+# Pure Go, no libc: required by the seccomp lockdown (see cmd/ksar/cgo_on.go).
 ksar: agent
-	$(GO) build -o ksar ./cmd/ksar
+	CGO_ENABLED=0 $(GO) build -o ksar ./cmd/ksar
 
 build/hello-init: $(shell find cmd/ksar-hello-init -name '*.go')
 	@mkdir -p build
@@ -42,6 +43,16 @@ build/alpine.tar:
 
 test: agent
 	$(GO) test ./...
+
+# Fuzz every parser of guest- or image-controlled input. FUZZTIME per target.
+FUZZTIME ?= 30s
+FUZZ_TARGETS := virtio:FuzzQueue virtio:FuzzBlock virtio:FuzzMMIO devices:FuzzSerial \
+	devices:FuzzPortBus agent/proto:FuzzReadFrame initramfs:FuzzAddTar boot:FuzzLoad
+fuzz:
+	@for t in $(FUZZ_TARGETS); do \
+		pkg=$${t%%:*}; fn=$${t#*:}; echo ">> $$fn"; \
+		$(GO) test ./internal/$$pkg -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) || exit 1; \
+	done
 
 # Keeps the downloaded kernel source; `make distclean` removes it too.
 clean:

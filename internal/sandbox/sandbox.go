@@ -45,6 +45,11 @@ type Options struct {
 	Timeout time.Duration
 	Console io.Writer // if set, the guest kernel log is shown here (verbose)
 
+	// Lockdown, if set, is called once the VM and its devices exist and
+	// before any guest code runs. Use it to apply irreversible process
+	// restrictions (see package harden).
+	Lockdown func() error
+
 	Files  []File
 	Exec   proto.Exec
 	Stdin  io.Reader // nil: empty stdin
@@ -107,6 +112,11 @@ func Run(opts Options) (Result, error) {
 		return res, err
 	}
 	defer m.Close()
+	if opts.Lockdown != nil {
+		if err := opts.Lockdown(); err != nil {
+			return res, fmt.Errorf("lockdown: %w", err)
+		}
+	}
 
 	// The vsock connection must be closed once the VM stops, or a session
 	// blocked reading from a dead guest would never return.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	"ksar/internal/agent/proto"
 	"ksar/internal/agentbin"
+	"ksar/internal/harden"
 	imagecache "ksar/internal/image"
 	"ksar/internal/sandbox"
 )
@@ -54,6 +56,9 @@ Flags:
 	workdir := fs.String("w", "", "working directory for the command")
 	verbose := fs.Bool("v", false, "show the guest kernel log and timing")
 	agentPath := fs.String("agent", "", "use this ksar-agent binary instead of the embedded one")
+	lockdown := fs.Bool("lockdown", true, "restrict ksar with seccomp before the guest runs (disable only to debug)")
+	allowRoot := fs.Bool("allow-root", false, "allow running as root (not recommended)")
+	cgroup := fs.String("cgroup", "auto", "run in a systemd scope with memory/CPU/task limits: auto, on or off")
 	var copies, envs multiFlag
 	fs.Var(&copies, "copy", "copy a host file into the guest: HOST_PATH:GUEST_PATH (repeatable)")
 	fs.Var(&envs, "e", "set an environment variable: KEY=VALUE (repeatable)")
@@ -67,10 +72,30 @@ Flags:
 		fmt.Fprintf(os.Stderr, "ksar: %v\n", err)
 		return exitKsarError
 	}
+	if err := harden.CheckUser(*allowRoot); err != nil {
+		return fail(err)
+	}
 
 	memSize, err := parseSize(*mem)
 	if err != nil {
 		return fail(fmt.Errorf("-mem: %w", err))
+	}
+	// Cgroup limits: guest RAM plus headroom for ksar itself, and in
+	// legacy mode the image held in RAM while the initramfs is built.
+	limits := cgroupLimits{MemoryMax: memSize + 256<<20, TasksMax: 256, CPUQuota: 150}
+	if *image != "" && (*legacy || !isKsarKernelFile(*kernel)) {
+		if st, err := os.Stat(*image); err == nil {
+			limits.MemoryMax += st.Size() * 3
+		}
+	}
+	if err := enterScope(*cgroup, limits, *verbose); err != nil {
+		return fail(err)
+	}
+	if *verbose {
+		if s := currentScope(); s != "" {
+			fmt.Fprintf(os.Stderr, "[ksar] cgroup scope %s (memory <= %d MiB, no swap, <= %d tasks, <= %d%% CPU)\n",
+				s, limits.MemoryMax>>20, limits.TasksMax, limits.CPUQuota)
+		}
 	}
 	kernelData, err := os.ReadFile(*kernel)
 	if err != nil {
@@ -132,6 +157,18 @@ Flags:
 	}
 	if *interactive {
 		opts.Stdin = os.Stdin
+	}
+	if *lockdown && builtWithCgo {
+		return fail(errors.New("this ksar was built with cgo, which the seccomp lockdown does not support; " +
+			"rebuild with `make ksar` (CGO_ENABLED=0)"))
+	}
+	if *lockdown {
+		opts.Lockdown = harden.Lockdown
+		if os.Getenv("KSAR_SECCOMP_DEBUG") != "" {
+			fmt.Fprintln(os.Stderr, "ksar: warning: KSAR_SECCOMP_DEBUG weakens the lockdown (blocked calls fail instead of killing ksar); debug only")
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "ksar: warning: running without lockdown; a VMM bug would expose this machine")
 	}
 	if *verbose {
 		opts.Console = os.Stderr
@@ -243,4 +280,16 @@ func isKsarKernel(k []byte) bool {
 	}
 	version, _, _ := strings.Cut(string(k[off:off+end]), " ")
 	return strings.HasSuffix(version, "-ksar")
+}
+
+// isKsarKernelFile is isKsarKernel for a path, reading only the header.
+func isKsarKernelFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 64<<10)
+	n, _ := io.ReadFull(f, head)
+	return isKsarKernel(head[:n])
 }
