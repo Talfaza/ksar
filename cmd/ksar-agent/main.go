@@ -325,8 +325,17 @@ func (a *agent) exec(m proto.Exec) error {
 	if len(m.Args) == 0 {
 		return a.out.WriteJSON(proto.TypeExit, proto.Exit{Code: 125, Error: "empty command"})
 	}
-	cmd := exec.Command(m.Args[0], m.Args[1:]...)
-	cmd.Env = append(append([]string(nil), defaultEnv...), m.Env...)
+	env := append(append([]string(nil), defaultEnv...), m.Env...)
+	// exec.Command would look the program up in the agent's own PATH; use
+	// the PATH the command will actually run with (image or -e), so e.g.
+	// a Go image's /usr/local/go/bin is found.
+	prog, err := lookPath(m.Args[0], envValue(env, "PATH"))
+	if err != nil {
+		return a.out.WriteJSON(proto.TypeExit, proto.Exit{Code: 127, Error: err.Error()})
+	}
+	cmd := exec.Command(prog, m.Args[1:]...)
+	cmd.Args[0] = m.Args[0]
+	cmd.Env = env
 	cmd.Dir = m.Dir
 	if cmd.Dir == "" {
 		cmd.Dir = "/"
@@ -355,6 +364,35 @@ func (a *agent) exec(m proto.Exec) error {
 		a.out.WriteJSON(proto.TypeExit, exitStatus(err))
 	}()
 	return nil
+}
+
+// envValue returns the last value of key in env (later entries win, as
+// os/exec does when it deduplicates).
+func envValue(env []string, key string) string {
+	v := ""
+	for _, kv := range env {
+		if k, val, ok := strings.Cut(kv, "="); ok && k == key {
+			v = val
+		}
+	}
+	return v
+}
+
+// lookPath finds an executable like the shell does, in the given PATH.
+func lookPath(name, path string) (string, error) {
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("exec: %q: executable file not found in $PATH (%s)", name, path)
 }
 
 func exitStatus(err error) proto.Exit {

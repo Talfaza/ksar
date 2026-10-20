@@ -127,6 +127,16 @@ suffix `-ksar` lets `ksar run` detect it and pick virtio mode.
 Next for the kernel: virtio-rng (entropy), and KVM_IOEVENTFD/IRQFD to skip
 VMM round trips on queue kicks.
 
+## Gaps found by real-project testing
+
+- Fixed: image environment (PATH etc.) lost by docker export -> NAME.tar.json
+  sidecar; the agent now resolves programs with the command's own PATH.
+- Fixed: guest kernel created an unused sit0 tunnel device -> IPV6_SIT off.
+- Open: copying a whole directory in (-copy and UI uploads are per file;
+  today: bake the project into the image, or upload a tar and untar it).
+- Open: projects whose `npm test` runs lint hooks needing git; images must
+  contain every tool a test script calls (no network to fetch them).
+
 ## Scope decisions
 
 - x86_64 only for now.

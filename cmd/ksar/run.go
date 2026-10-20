@@ -127,6 +127,18 @@ Flags:
 	if err != nil {
 		return fail(err)
 	}
+	// The image's own environment and working directory (lost by docker
+	// export, kept in NAME.tar.json) apply first; -e and -w override them.
+	if *image != "" {
+		cfg, err := imagecache.LoadConfig(*image)
+		if err != nil {
+			return fail(err)
+		}
+		envs = append(append(multiFlag{}, cfg.Env...), envs...)
+		if *workdir == "" {
+			*workdir = cfg.WorkingDir
+		}
+	}
 
 	virtioMode := isKsarKernel(kernelData) && !*legacy
 	ev.emit("started", map[string]any{

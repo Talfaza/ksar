@@ -265,3 +265,20 @@ func TestVirtioHidesAgent(t *testing.T) {
 		}
 	}
 }
+
+// A program found only through a custom PATH (as images like golang set):
+// the agent must resolve it with the command's PATH, not its own.
+func TestCustomPATH(t *testing.T) {
+	each(t, func(t *testing.T, m mode) {
+		opts := Options{
+			Files: []File{{Path: "/opt/tools/bin/hello-tool", Mode: 0o755, Data: []byte("#!/bin/sh\necho found via PATH\n")}},
+			Exec: proto.Exec{Args: []string{"hello-tool"},
+				Env: []string{"PATH=/opt/tools/bin:/usr/bin:/bin"}},
+		}
+		withAlpine(t, m, &opts)
+		res, stdout, _ := run(t, m, opts)
+		if res.Exit.Code != 0 || stdout != "found via PATH\n" {
+			t.Errorf("exit %+v stdout %q", res.Exit, stdout)
+		}
+	})
+}

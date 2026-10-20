@@ -230,6 +230,19 @@ func exportImage(docker, ref, out string) error {
 		os.Remove(tmp)
 		return err
 	}
+	// Keep what the export drops: environment and working directory.
+	if js, err := run("inspect", "--format", "{{json .Config}}", ref); err == nil {
+		var c struct {
+			Env        []string
+			WorkingDir string
+		}
+		if json.Unmarshal([]byte(js), &c) == nil {
+			if err := image.SaveConfig(out, image.Config{Env: c.Env, WorkingDir: c.WorkingDir}); err != nil {
+				os.Remove(tmp)
+				return err
+			}
+		}
+	}
 	return os.Rename(tmp, out)
 }
 
@@ -247,6 +260,7 @@ func (l *imageLibrary) remove(name string) error {
 	if c, _, cached := image.Cached(p); cached {
 		os.Remove(c)
 	}
+	os.Remove(image.ConfigPath(p))
 	return os.Remove(p)
 }
 

@@ -127,6 +127,23 @@ Images are converted to EROFS disks on first use and cached in
 `~/.cache/ksar/images` (keyed on the tar's path, size and mtime). Delete
 that directory to reclaim space.
 
+**Image settings.** `docker export` keeps only the filesystem, not the
+image's environment (for example the `PATH` where a Go, Java or Rust
+image installs its toolchain) or working directory. Ksar reads them from
+an optional file next to the tar, `NAME.tar.json`:
+
+```json
+{ "env": ["PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin", "GOPATH=/go"], "workdir": "/src" }
+```
+
+The web UI's Docker import writes it automatically. To make one by hand:
+`docker inspect IMAGE --format '{{json .Config}}'` has the values. `-e`
+and `-w` override what the file sets.
+
+**Writable space.** Writes go to a RAM-backed layer of up to half the
+guest RAM (about 120 MB with the default 256 MB). Give more `-mem` to
+commands that write a lot.
+
 Tested with Alpine, Debian, Ubuntu, Fedora and Arch Linux images, all in
 the default 256 MiB.
 
@@ -281,6 +298,26 @@ the timeout. It has no network: there is no network device at all.
 - Output sent to pipes and files is not filtered, by design.
 - No security audit has been done. Treat Ksar as defense in depth, not a
   guarantee.
+
+## Tested with real projects
+
+Each ran its own test suite inside a VM with no network, dependencies
+baked into the image, four VMs at once:
+
+| Project | Command | Result |
+|---|---|---|
+| [more-itertools](https://github.com/more-itertools/more-itertools) (Python) | `python3 -m pytest` | 765 tests + 21,194 subtests passed, 20 s, 1 GB |
+| [node-semver](https://github.com/npm/node-semver) (Node.js) | `npm test --ignore-scripts` (tap) | passed, 100% coverage, 38 s, 1.5 GB |
+| [google/uuid](https://github.com/google/uuid) (Go) | `go test ./...` (compiled in the VM) | passed, 17 s, 1 GB |
+| [cJSON](https://github.com/DaveGamble/cJSON) (C) | cmake build + `ctest` | 19/19 passed, 8 s, 1 GB |
+
+And hostile workloads, all contained with the host unaffected: reaching
+the internet (no network interface but `lo`), finding host files or SSH
+keys, writing to the image disk (read-only), a fork bomb and an infinite
+loop (killed at the timeout), holding 1.5 GB in a 256 MB guest (the guest's
+OOM killer stops it), filling the disk (only the RAM layer fills), loading
+kernel modules or triggering sysrq (not supported by the guest kernel),
+and terminal escape injection (filtered).
 
 ## Performance
 
