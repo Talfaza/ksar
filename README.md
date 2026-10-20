@@ -78,7 +78,7 @@ ksar run [flags] [--] COMMAND [ARGS...]
 | `-mem SIZE` | `256M` | Guest RAM (e.g. `512M`, `2G`; at most 3 GiB). |
 | `-timeout D` | `1m` | Kill the VM after this long (`0` = never). |
 | `-i` | off | Forward ksar's stdin to the command. |
-| `-copy HOST:GUEST` | | Copy a host file into the guest before running (repeatable). |
+| `-copy HOST:GUEST` | | Copy a host file or directory into the guest before running (repeatable). |
 | `-e KEY=VALUE` | | Set an environment variable (repeatable). |
 | `-w DIR` | `/` | Working directory inside the guest. |
 | `-v` | off | Show the guest kernel log, timings and the cgroup scope. |
@@ -107,6 +107,9 @@ Like `docker run`: the command's own exit code, or
 ```sh
 # Run a script from the host
 ksar run -image build/alpine.tar -copy ./test.sh:/work/test.sh -w /work -- sh test.sh
+
+# Test a whole project checkout (the directory is copied in; your copy is untouched)
+ksar run -mem 1G -image python.tar -copy ./myproject:/work/myproject -w /work/myproject -- python3 -m pytest
 
 # Pipe data through a sandboxed command
 sort -R names.txt | ksar run -i -image build/alpine.tar -- sort -u
@@ -139,6 +142,14 @@ an optional file next to the tar, `NAME.tar.json`:
 The web UI's Docker import writes it automatically. To make one by hand:
 `docker inspect IMAGE --format '{{json .Config}}'` has the values. `-e`
 and `-w` override what the file sets.
+
+**Copying directories.** `-copy DIR:/guest/path` (and "Add folder" in the
+web UI) copies a directory tree, with permissions and empty directories,
+as one stream. The directory is treated as untrusted: symlinks are copied
+as links and never followed, so a link like `notes -> ~/.ssh/id_rsa`
+can't pull your key into the guest; device files, sockets and pipes are
+skipped. Browsers don't send permissions, so in the web UI files starting
+with `#!` are made executable and the rest are not.
 
 **Writable space.** Writes go to a RAM-backed layer of up to half the
 guest RAM (about 120 MB with the default 256 MB). Give more `-mem` to

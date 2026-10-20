@@ -27,6 +27,13 @@ type File struct {
 	Data []byte
 }
 
+// Dir is a directory to place in the guest: Tar is an archive of its
+// contents (see PackDir), extracted into Path.
+type Dir struct {
+	Path string
+	Tar  io.Reader
+}
+
 // Options configures a sandboxed run.
 type Options struct {
 	Kernel  []byte // bzImage
@@ -55,6 +62,7 @@ type Options struct {
 	OnReady func(boot time.Duration, cid uint32)
 
 	Files  []File
+	Dirs   []Dir
 	Exec   proto.Exec
 	Stdin  io.Reader // nil: empty stdin
 	Stdout io.Writer
@@ -199,6 +207,11 @@ func session(ch io.ReadWriter, opts Options, start time.Time, cid uint32) (proto
 	}
 	for _, f := range opts.Files {
 		if err := c.PutFile(f.Path, f.Mode, bytes.NewReader(f.Data)); err != nil {
+			return proto.Exit{}, boot, err
+		}
+	}
+	for _, d := range opts.Dirs {
+		if _, err := c.PutDir(d.Path, d.Tar); err != nil {
 			return proto.Exit{}, boot, err
 		}
 	}

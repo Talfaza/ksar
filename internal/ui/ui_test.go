@@ -1,6 +1,9 @@
 package ui
 
 import (
+	"bytes"
+	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -208,5 +211,89 @@ func TestRunThroughServer(t *testing.T) {
 	}
 	if info.Filtered != 1 || !info.Lockdown || !info.Virtio || info.BootMs == 0 || info.CID == 0 {
 		t.Errorf("info = %+v", info)
+	}
+}
+
+func TestRelPath(t *testing.T) {
+	for in, want := range map[string]string{"a.txt": "a.txt", "src/a.go": "src/a.go", "./x/../y": "y", "a//b": "a/b"} {
+		if got, err := relPath(in); err != nil || got != want {
+			t.Errorf("relPath(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "/etc/passwd", "../x", "a/../../x", "..", ".", "a\x00b", `a\..\b`, strings.Repeat("x", 300)} {
+		if _, err := relPath(bad); err == nil {
+			t.Errorf("relPath(%q) accepted", bad)
+		}
+	}
+}
+
+// multipartDir builds a folder upload body: parts are (field, value) pairs.
+func multipartDir(t *testing.T, parts [][2]string) (string, *bytes.Buffer) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for _, p := range parts {
+		if p[0] == "file" {
+			w, _ := mw.CreateFormFile("file", "f")
+			w.Write([]byte(p[1]))
+		} else {
+			mw.WriteField(p[0], p[1])
+		}
+	}
+	mw.Close()
+	return mw.FormDataContentType(), &buf
+}
+
+func TestFolderUpload(t *testing.T) {
+	s := testServer(t, "/bin/false")
+	post := func(parts [][2]string) *httptest.ResponseRecorder {
+		ct, body := multipartDir(t, parts)
+		return s.do("POST", "/api/uploads/dir?name=proj", body.String(),
+			map[string]string{"Cookie": s.cookie + "=" + s.token, "Origin": s.origin, "Content-Type": ct})
+	}
+	rec := post([][2]string{{"dir", "empty/sub"}, {"path", "src/main.go"}, {"file", "package main"},
+		{"path", "run.sh"}, {"file", "#!/bin/sh\necho hi"}})
+	if rec.Code != 200 {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body)
+	}
+	var u upload
+	json.Unmarshal(rec.Body.Bytes(), &u)
+	stored, _ := s.up.get(u.ID)
+	if !u.Dir || u.Files != 2 || u.Name != "proj" {
+		t.Errorf("upload = %+v", u)
+	}
+	if b, _ := os.ReadFile(filepath.Join(stored.path, "src/main.go")); string(b) != "package main" {
+		t.Errorf("src/main.go = %q", b)
+	}
+	if st, err := os.Stat(filepath.Join(stored.path, "run.sh")); err != nil || st.Mode().Perm() != 0o755 {
+		t.Errorf("run.sh mode = %v, %v (scripts should be executable)", st.Mode(), err)
+	}
+	if st, err := os.Stat(filepath.Join(stored.path, "src/main.go")); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("main.go mode = %v", st.Mode())
+	}
+	if st, err := os.Stat(filepath.Join(stored.path, "empty/sub")); err != nil || !st.IsDir() {
+		t.Error("empty directory not created")
+	}
+
+	for name, parts := range map[string][][2]string{
+		"escape with ..":    {{"path", "../../evil"}, {"file", "x"}},
+		"absolute path":     {{"path", "/tmp/evil"}, {"file", "x"}},
+		"file without path": {{"file", "x"}},
+		"duplicate file":    {{"path", "a"}, {"file", "1"}, {"path", "a"}, {"file", "2"}},
+		"dir escape":        {{"dir", "../outside"}},
+	} {
+		if rec := post(parts); rec.Code != 400 {
+			t.Errorf("%s: status %d, want 400", name, rec.Code)
+		}
+	}
+	// Nothing may have been written next to the upload directories.
+	entries, _ := os.ReadDir(filepath.Dir(stored.path))
+	for _, e := range entries {
+		if !e.IsDir() {
+			t.Errorf("stray file %s outside any upload", e.Name())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(stored.path), "outside")); err == nil {
+		t.Error("dir escape created a directory outside the upload")
 	}
 }

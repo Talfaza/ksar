@@ -47,6 +47,9 @@ const (
 	TypeExec       = 0x13 // JSON Exec: run a command
 	TypeStdin      = 0x14 // raw bytes for the command's stdin
 	TypeStdinClose = 0x15 // close the command's stdin
+	TypeTarOpen    = 0x16 // JSON TarOpen: start extracting a tar stream into a directory
+	TypeTarData    = 0x17 // raw bytes of the tar stream
+	TypeTarClose   = 0x18 // end of stream; guest replies with Result
 )
 
 const (
@@ -80,6 +83,13 @@ type FileOpen struct {
 // Result reports the outcome of a file transfer.
 type Result struct {
 	Error string `json:"error,omitempty"`
+	Files int    `json:"files,omitempty"` // entries written, for directory copies
+}
+
+// TarOpen starts a directory copy: the tar stream that follows is
+// extracted into Dir (created if needed).
+type TarOpen struct {
+	Dir string `json:"dir"`
 }
 
 // Exec asks the agent to run a command.

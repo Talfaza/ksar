@@ -13,6 +13,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -219,6 +221,9 @@ type agent struct {
 	fileE error          // first error during the current transfer
 	stdin *io.PipeWriter // running command's stdin, if any
 	busy  atomic.Bool    // a command is running
+
+	tarW    *io.PipeWriter // directory copy in progress, if any
+	tarDone chan proto.Result
 }
 
 func (a *agent) serve() error {
@@ -289,10 +294,119 @@ func (a *agent) handle(f proto.Frame) error {
 			a.stdin.Close()
 			a.stdin = nil
 		}
+	case proto.TypeTarOpen:
+		var m proto.TarOpen
+		if err := proto.Decode(f, &m); err != nil {
+			return err
+		}
+		a.openTar(m.Dir)
+	case proto.TypeTarData:
+		if a.tarW != nil {
+			// Blocks until the extractor consumes it; credit is granted
+			// only after, so the host never runs ahead of the disk.
+			a.tarW.Write(f.Payload)
+		}
+	case proto.TypeTarClose:
+		res := proto.Result{Error: "no directory copy in progress"}
+		if a.tarW != nil {
+			a.tarW.Close()
+			res = <-a.tarDone
+			a.tarW, a.tarDone = nil, nil
+		}
+		return a.out.WriteJSON(proto.TypeResult, res)
 	default:
 		return fmt.Errorf("unknown frame type %#x", f.Type)
 	}
 	return nil
+}
+
+// openTar starts extracting a tar stream into dir. On any error the
+// extractor keeps draining the stream so the protocol stays in step, and
+// reports the first error when the host closes the stream.
+func (a *agent) openTar(dir string) {
+	if a.tarW != nil {
+		a.tarW.CloseWithError(errors.New("superseded"))
+		<-a.tarDone
+	}
+	pr, pw := io.Pipe()
+	done := make(chan proto.Result, 1)
+	a.tarW, a.tarDone = pw, done
+	go func() {
+		var res proto.Result
+		if !filepath.IsAbs(dir) {
+			res.Error = fmt.Sprintf("destination %q is not absolute", dir)
+		} else if n, err := extractTar(pr, dir); err != nil {
+			res.Error, res.Files = err.Error(), n
+		} else {
+			res.Files = n
+		}
+		io.Copy(io.Discard, pr)
+		done <- res
+	}()
+}
+
+// extractTar unpacks a tar stream under dest. Every name is confined to
+// dest (absolute names and ".." are folded back inside), regular files
+// are created without following an existing symlink, and anything other
+// than files, directories and symlinks is ignored.
+func extractTar(r io.Reader, dest string) (int, error) {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return 0, err
+	}
+	tr := tar.NewReader(r)
+	n := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, fmt.Errorf("read archive: %w", err)
+		}
+		rel := path.Clean("/" + h.Name)
+		if rel == "/" {
+			continue
+		}
+		target := filepath.Join(dest, filepath.FromSlash(rel))
+		mode := os.FileMode(h.Mode & 0o7777)
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return n, err
+			}
+			os.Chmod(target, mode|0o700) // keep it writable for the files inside
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return n, err
+			}
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+			if err != nil {
+				return n, err
+			}
+			_, err = io.Copy(f, tr)
+			if err == nil {
+				err = f.Chmod(mode)
+			}
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			if err != nil {
+				return n, fmt.Errorf("%s: %w", rel, err)
+			}
+			os.Chtimes(target, h.ModTime, h.ModTime)
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return n, err
+			}
+			os.Remove(target)
+			if err := os.Symlink(h.Linkname, target); err != nil {
+				return n, err
+			}
+		default:
+			continue
+		}
+		n++
+	}
 }
 
 func (a *agent) openFile(m proto.FileOpen) {

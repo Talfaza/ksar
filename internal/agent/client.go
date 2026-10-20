@@ -135,6 +135,44 @@ func (c *Client) PutFile(path string, mode uint32, r io.Reader) error {
 	return nil
 }
 
+// PutDir streams the tar archive r into directory dir in the guest and
+// returns how many entries were written.
+func (c *Client) PutDir(dir string, r io.Reader) (int, error) {
+	if err := c.cw.WriteJSON(proto.TypeTarOpen, proto.TarOpen{Dir: dir}); err != nil {
+		return 0, err
+	}
+	buf := make([]byte, proto.MaxHostFrame)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if werr := c.cw.Write(proto.TypeTarData, buf[:n]); werr != nil {
+				return 0, werr
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := c.cw.Write(proto.TypeTarClose, nil); err != nil {
+		return 0, err
+	}
+	f, err := c.expect(proto.TypeResult)
+	if err != nil {
+		return 0, err
+	}
+	var res proto.Result
+	if err := proto.Decode(f, &res); err != nil {
+		return 0, err
+	}
+	if res.Error != "" {
+		return res.Files, fmt.Errorf("copy to %s: %s", dir, res.Error)
+	}
+	return res.Files, nil
+}
+
 // Run executes a command in the guest, streaming its output to stdout and
 // stderr. If stdin is nil the command gets an empty stdin.
 func (c *Client) Run(e proto.Exec, stdin io.Reader, stdout, stderr io.Writer) (proto.Exit, error) {

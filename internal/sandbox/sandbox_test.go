@@ -282,3 +282,41 @@ func TestCustomPATH(t *testing.T) {
 		}
 	})
 }
+
+// A whole directory, with nesting, an empty dir, an executable script and
+// a symlink that points at a host file (copied as a link, not followed).
+func TestCopyDirectory(t *testing.T) {
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "a/b"), 0o755)
+	os.MkdirAll(filepath.Join(src, "empty"), 0o755)
+	os.WriteFile(filepath.Join(src, "a/b/data.txt"), []byte("nested"), 0o644)
+	os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\necho ran\n"), 0o755)
+	secret := filepath.Join(t.TempDir(), "host-secret")
+	os.WriteFile(secret, []byte("TOP SECRET"), 0o600)
+	os.Symlink(secret, filepath.Join(src, "leak"))
+
+	each(t, func(t *testing.T, m mode) {
+		var tarball bytes.Buffer
+		st, err := PackDir(&tarball, src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Files != 2 || st.Symlinks != 1 {
+			t.Errorf("pack stats = %+v", st)
+		}
+		opts := Options{
+			Dirs: []Dir{{Path: "/work/p", Tar: &tarball}},
+			Exec: proto.Exec{Args: []string{"sh", "-c",
+				"cat a/b/data.txt; echo; ./run.sh; test -d empty && echo empty-ok; cat leak 2>/dev/null || echo leak-blocked"},
+				Dir: "/work/p"},
+		}
+		withAlpine(t, m, &opts)
+		_, stdout, stderr := run(t, m, opts)
+		if want := "nested\nran\nempty-ok\nleak-blocked\n"; stdout != want {
+			t.Errorf("stdout = %q, want %q (stderr %q)", stdout, want, stderr)
+		}
+		if strings.Contains(stdout, "TOP SECRET") {
+			t.Fatal("a host file leaked into the guest through a symlink")
+		}
+	})
+}

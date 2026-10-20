@@ -132,8 +132,9 @@ VMM round trips on queue kicks.
 - Fixed: image environment (PATH etc.) lost by docker export -> NAME.tar.json
   sidecar; the agent now resolves programs with the command's own PATH.
 - Fixed: guest kernel created an unused sit0 tunnel device -> IPV6_SIT off.
-- Open: copying a whole directory in (-copy and UI uploads are per file;
-  today: bake the project into the image, or upload a tar and untar it).
+- Fixed: copying a whole directory in: -copy DIR and UI "Add folder" stream a
+  tar (TarOpen/Data/Close) packed before lockdown into an unlinked temp
+  file; symlinks never followed, special files skipped.
 - Open: projects whose `npm test` runs lint hooks needing git; images must
   contain every tool a test script calls (no network to fetch them).
 

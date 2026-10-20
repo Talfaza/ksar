@@ -111,6 +111,21 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 		writeJSON(w, u)
 	})
 
+	mux.HandleFunc("POST /api/uploads/dir", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxDirUploadBytes+16<<20)
+		mr, err := r.MultipartReader()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("upload: %w", err))
+			return
+		}
+		u, err := s.up.addDir(r.URL.Query().Get("name"), mr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, u)
+	})
+
 	mux.HandleFunc("GET /api/images", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.images.list())
 	})

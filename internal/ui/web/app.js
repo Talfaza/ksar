@@ -30,6 +30,7 @@ const ICONS = {
   bolt: 'M13 2L4 14h7l-1 8 9-12h-7l1-8z',
   netOff: 'M2 2l20 20M8.5 16.5a5 5 0 0 1 7 0M2 8.8a15 15 0 0 1 4.2-2.7M10.7 5.1A15 15 0 0 1 22 8.8M5 12.9a10 10 0 0 1 5.2-2.7M12 20h.01',
   disk: 'M4 4h16v16H4zM4 15h16M8 18h.01',
+  folder: 'M3 6h6l2 2h10v11H3z',
   replay: 'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5',
   info: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 11v6M12 7v.01',
   wrap: 'M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7',
@@ -404,18 +405,26 @@ async function viewNew(main) {
       icon('download'), h('span', { class: 'muted' }, 'Import an image…')));
   }
 
-  // Files
+  // Files and folders
   const fileList = h('div', { class: 'stack', style: 'gap:6px' });
-  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, onchange: e => uploadFiles(e.target.files) });
+  const uploads = h('div', { class: 'stack', style: 'gap:6px' }); // in progress
+  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, onchange: e => { uploadFiles(e.target.files); e.target.value = ''; } });
+  const folderInput = h('input', {
+    type: 'file', multiple: true, hidden: true, webkitdirectory: true,
+    onchange: e => { uploadPickedFolder(e.target.files); e.target.value = ''; },
+  });
   const drop = h('div', {
-    class: 'dropzone', tabIndex: 0, role: 'button',
-    onclick: () => fileInput.click(),
-    onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } },
+    class: 'dropzone',
     ondragover: e => { e.preventDefault(); drop.classList.add('over'); },
     ondragleave: () => drop.classList.remove('over'),
-    ondrop: e => { e.preventDefault(); drop.classList.remove('over'); uploadFiles(e.dataTransfer.files); },
-  }, icon('upload'), h('span', { class: 'label' }, 'Drop files or click to add'),
-  h('span', { class: 'small muted' }, 'Copied into the guest before the command starts (up to 64 MB each). The host copies stay on the host.'));
+    ondrop: e => { e.preventDefault(); drop.classList.remove('over'); handleDrop(e.dataTransfer); },
+  }, icon('upload'), h('span', { class: 'label' }, 'Drop files or folders here'),
+  h('div', { class: 'row', style: 'justify-content:center' },
+    h('button', { type: 'button', class: 'btn sm', onclick: () => fileInput.click() }, icon('disk'), 'Add files'),
+    h('button', { type: 'button', class: 'btn sm', onclick: () => folderInput.click() }, icon('folder'), 'Add folder')),
+  h('span', { class: 'small muted' }, 'Copied into the guest before the command starts: files up to 64 MB, folders up to 512 MB. ' +
+    'Browsers don\'t send permissions, so scripts starting with #! are made executable. Your originals stay on the host.'));
+
   async function uploadFiles(list) {
     for (const f of list) {
       const fd = new FormData();
@@ -426,14 +435,83 @@ async function viewNew(main) {
         renderFiles();
       } catch (e) { toast(f.name + ': ' + e.message, 'err'); }
     }
-    fileInput.value = '';
   }
+
+  // A folder picked with the folder dialog: each file knows its path
+  // relative to the picked folder's parent ("proj/src/a.js").
+  function uploadPickedFolder(list) {
+    const byTop = new Map();
+    for (const f of list) {
+      const [top, ...rest] = f.webkitRelativePath.split('/');
+      if (!byTop.has(top)) byTop.set(top, []);
+      byTop.get(top).push({ file: f, rel: rest.join('/') });
+    }
+    for (const [name, items] of byTop) uploadFolder(name, items, []);
+  }
+
+  // Drag and drop: folders arrive as directory entries to walk. Entries
+  // must be taken synchronously, before the drop event ends.
+  function handleDrop(dt) {
+    const entries = Array.from(dt.items || [], it => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+    if (!entries.length) { uploadFiles(dt.files); return; }
+    const files = [];
+    for (const entry of entries) {
+      if (entry.isDirectory) walkFolder(entry).then(({ items, dirs }) => uploadFolder(entry.name, items, dirs), e => toast(e.message, 'err'));
+      else files.push(new Promise((res, rej) => entry.file(res, rej)));
+    }
+    Promise.all(files).then(uploadFiles, e => toast(e.message, 'err'));
+  }
+  async function walkFolder(root) {
+    const items = [], dirs = [];
+    const readAll = reader => new Promise((res, rej) => {
+      const out = [];
+      const next = () => reader.readEntries(batch => { if (!batch.length) res(out); else { out.push(...batch); next(); } }, rej);
+      next();
+    });
+    async function walk(dir, prefix) {
+      const children = await readAll(dir.createReader());
+      if (!children.length && prefix) dirs.push(prefix.slice(0, -1));
+      for (const c of children) {
+        if (c.isDirectory) await walk(c, prefix + c.name + '/');
+        else items.push({ file: await new Promise((res, rej) => c.file(res, rej)), rel: prefix + c.name });
+      }
+    }
+    await walk(root, '');
+    return { items, dirs };
+  }
+
+  function uploadFolder(name, items, dirs) {
+    const total = items.reduce((a, it) => a + it.file.size, 0);
+    const bar = h('div', { style: 'width:0%' });
+    const label = h('span', { class: 'small muted' }, 'Uploading ' + items.length + ' files (' + fmtBytes(total) + ')…');
+    const row = h('div', { class: 'file-row' }, icon('folder'), h('span', { class: 'name' }, name + '/'), label,
+      h('div', { class: 'bar', style: 'flex:1' }, bar));
+    uploads.append(row);
+    const fd = new FormData();
+    for (const d of dirs) fd.append('dir', d);
+    for (const it of items) { fd.append('path', it.rel); fd.append('file', it.file, 'f'); }
+    // XMLHttpRequest, not fetch, for upload progress.
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/uploads/dir?name=' + encodeURIComponent(name));
+    xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (100 * e.loaded / e.total).toFixed(1) + '%'; };
+    xhr.onload = () => {
+      row.remove();
+      let u = {};
+      try { u = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status !== 200) { toast(name + ': ' + (u.error || xhr.statusText), 'err'); return; }
+      form.files.push({ upload: u.id, name: u.name, size: u.size, files: u.files, dir: true, path: '/work/' + u.name });
+      renderFiles();
+    };
+    xhr.onerror = () => { row.remove(); toast(name + ': upload failed', 'err'); };
+    xhr.send(fd);
+  }
+
   function renderFiles() {
     clear(fileList);
     for (const f of form.files) {
-      fileList.append(h('div', { class: 'file-row' }, icon('disk'),
-        h('span', { class: 'name', title: f.name }, f.name),
-        h('span', { class: 'faint small' }, fmtBytes(f.size) + ' →'),
+      fileList.append(h('div', { class: 'file-row' }, icon(f.dir ? 'folder' : 'disk'),
+        h('span', { class: 'name', title: f.name }, f.dir ? f.name + '/' : f.name),
+        h('span', { class: 'faint small' }, (f.dir ? f.files + ' files, ' : '') + fmtBytes(f.size) + ' →'),
         h('input', { class: 'input', value: f.path, 'aria-label': 'Guest path for ' + f.name, oninput: e => { f.path = e.target.value; } }),
         h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove ' + f.name, onclick: () => { form.files.splice(form.files.indexOf(f), 1); renderFiles(); } }, icon('x'))));
     }
@@ -468,7 +546,11 @@ async function viewNew(main) {
       ['Network', 'none: no network device'],
       ['Memory', fmtMem(form.mem) + ' guest RAM'],
       ['Timeout', form.timeout + ' s, then the VM is killed'],
-      ['Files copied in', String(form.files.length)],
+      ['Copied in', (() => {
+        const dirs = form.files.filter(f => f.dir).length;
+        const files = form.files.length - dirs;
+        return files + ' file(s), ' + dirs + ' folder(s)';
+      })()],
       ['Afterwards', 'VM destroyed, nothing kept'],
     ];
     for (const [k, v] of lines) summary.append(h('div', { class: 'kv' }, h('span', {}, k), h('span', {}, v)));
@@ -508,8 +590,8 @@ async function viewNew(main) {
           h('div', { class: 'card-head' }, icon('layers'), h('h2', {}, 'Root filesystem')),
           imageGrid),
         h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('upload'), h('h2', {}, 'Files to copy in')),
-          drop, fileInput, fileList),
+          h('div', { class: 'card-head' }, icon('upload'), h('h2', {}, 'Files and folders to copy in')),
+          drop, fileInput, folderInput, uploads, fileList),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, icon('cpu'), h('h2', {}, 'Resources')),
           h('div', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory'), memPicker.el),

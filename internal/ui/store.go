@@ -1,17 +1,21 @@
 package ui
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"ksar/internal/image"
@@ -20,15 +24,20 @@ import (
 // --- Uploads: files the browser sends to copy into a guest. ---
 
 const (
-	maxUploadBytes = 64 << 20
-	maxUploadTotal = 512 << 20
+	maxUploadBytes    = 64 << 20  // one file
+	maxDirUploadBytes = 512 << 20 // one folder, all files together
+	maxDirFiles       = 20000
+	maxUploadTotal    = 1 << 30
+	maxRelPath        = 4096
 )
 
 type upload struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
-	path string
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Size  int64  `json:"size"`
+	Dir   bool   `json:"dir"`
+	Files int    `json:"files,omitempty"`
+	path  string
 }
 
 type uploadStore struct {
@@ -78,6 +87,123 @@ func (s *uploadStore) add(name string, r io.Reader) (upload, error) {
 	return u, nil
 }
 
+// relPath validates a path inside an uploaded folder, as sent by the
+// browser. It must stay inside the folder: relative, no "..", no NUL.
+func relPath(p string) (string, error) {
+	if p == "" || len(p) > maxRelPath || strings.ContainsRune(p, 0) || strings.Contains(p, "\\") {
+		return "", fmt.Errorf("invalid path %q", p)
+	}
+	clean := path.Clean(p)
+	if path.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("path %q leaves the folder", p)
+	}
+	for _, part := range strings.Split(clean, "/") {
+		if len(part) > 255 {
+			return "", fmt.Errorf("path %q has a name longer than 255 bytes", p)
+		}
+	}
+	return clean, nil
+}
+
+// addDir stores a folder sent as a multipart sequence of "path" fields
+// each followed by its "file", plus "dir" fields for empty directories.
+// Browsers don't send permissions, so files starting with "#!" are made
+// executable; everything else is 0644.
+func (s *uploadStore) addDir(name string, mr *multipart.Reader) (upload, error) {
+	u := upload{ID: newID(), Name: filepath.Base(name), Dir: true}
+	if u.Name == "." || u.Name == "/" || u.Name == "" {
+		u.Name = "folder"
+	}
+	u.path = filepath.Join(s.dir, u.ID)
+	if err := os.Mkdir(u.path, 0o700); err != nil {
+		return u, err
+	}
+	fail := func(err error) (upload, error) {
+		os.RemoveAll(u.path)
+		return u, err
+	}
+	readValue := func(p *multipart.Part) (string, error) {
+		b, err := io.ReadAll(io.LimitReader(p, maxRelPath+1))
+		if err != nil {
+			return "", err
+		}
+		if len(b) > maxRelPath {
+			return "", errors.New("path too long")
+		}
+		return string(b), nil
+	}
+	pending := ""
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fail(fmt.Errorf("upload: %w", err))
+		}
+		switch part.FormName() {
+		case "path", "dir":
+			v, err := readValue(part)
+			if err != nil {
+				return fail(err)
+			}
+			rel, err := relPath(v)
+			if err != nil {
+				return fail(err)
+			}
+			if part.FormName() == "dir" {
+				if err := os.MkdirAll(filepath.Join(u.path, filepath.FromSlash(rel)), 0o755); err != nil {
+					return fail(err)
+				}
+				continue
+			}
+			pending = rel
+		case "file":
+			if pending == "" {
+				return fail(errors.New("upload: file without a path"))
+			}
+			if u.Files >= maxDirFiles {
+				return fail(fmt.Errorf("folder has more than %d files", maxDirFiles))
+			}
+			target := filepath.Join(u.path, filepath.FromSlash(pending))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fail(err)
+			}
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
+			if err != nil {
+				return fail(fmt.Errorf("%s: %w", pending, err))
+			}
+			br := bufio.NewReader(io.LimitReader(part, maxDirUploadBytes-u.Size+1))
+			head, _ := br.Peek(2)
+			n, err := io.Copy(f, br)
+			if err == nil && string(head) == "#!" {
+				err = f.Chmod(0o755)
+			}
+			f.Close()
+			if err != nil {
+				return fail(err)
+			}
+			u.Size += n
+			if u.Size > maxDirUploadBytes {
+				return fail(fmt.Errorf("folder is larger than %d MB", maxDirUploadBytes>>20))
+			}
+			u.Files++
+			pending = ""
+		default:
+			io.Copy(io.Discard, part)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.total+u.Size > maxUploadTotal {
+		os.RemoveAll(u.path)
+		return u, fmt.Errorf("uploads exceed %d MB in total; finish or remove some runs first", maxUploadTotal>>20)
+	}
+	s.total += u.Size
+	s.files[u.ID] = u
+	return u, nil
+}
+
 func (s *uploadStore) get(id string) (upload, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,7 +215,7 @@ func (s *uploadStore) remove(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if u, ok := s.files[id]; ok {
-		os.Remove(u.path)
+		os.RemoveAll(u.path)
 		s.total -= u.Size
 		delete(s.files, id)
 	}

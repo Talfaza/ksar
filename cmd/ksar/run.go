@@ -66,7 +66,7 @@ Flags:
 	eventsFD := fs.Int("events-fd", -1, "write machine-readable JSON events to this open file descriptor (for the web UI)")
 	consoleFD := fs.Int("console-fd", -1, "write the guest kernel log to this open file descriptor (for the web UI)")
 	var copies, envs multiFlag
-	fs.Var(&copies, "copy", "copy a host file into the guest: HOST_PATH:GUEST_PATH (repeatable)")
+	fs.Var(&copies, "copy", "copy a host file or directory into the guest: HOST_PATH:GUEST_PATH (repeatable)")
 	fs.Var(&envs, "e", "set an environment variable: KEY=VALUE (repeatable)")
 	fs.Parse(args)
 
@@ -123,7 +123,7 @@ Flags:
 			return fail(fmt.Errorf("-e %q: want KEY=VALUE", e))
 		}
 	}
-	files, err := parseCopies(copies)
+	files, dirs, err := parseCopies(copies, *verbose)
 	if err != nil {
 		return fail(err)
 	}
@@ -153,6 +153,7 @@ Flags:
 		MemSize: int(memSize),
 		Timeout: *timeout,
 		Files:   files,
+		Dirs:    dirs,
 		Exec:    proto.Exec{Args: fs.Args(), Env: envs, Dir: *workdir},
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
@@ -263,31 +264,72 @@ func runSandbox(opts sandbox.Options, verbose, raw bool, timeout time.Duration, 
 	return res.Exit.Code
 }
 
-// parseCopies reads each HOST:GUEST pair into memory.
-func parseCopies(specs []string) ([]sandbox.File, error) {
+// parseCopies prepares each HOST:GUEST pair. Files are read into memory;
+// directories are packed into an unlinked temporary file. Both happen
+// before lockdown, which forbids opening files; the open temp file is
+// then streamed into the guest.
+func parseCopies(specs []string, verbose bool) ([]sandbox.File, []sandbox.Dir, error) {
 	var files []sandbox.File
+	var dirs []sandbox.Dir
 	for _, spec := range specs {
 		host, guest, ok := strings.Cut(spec, ":")
 		if !ok || host == "" || guest == "" {
-			return nil, fmt.Errorf("-copy %q: want HOST_PATH:GUEST_PATH", spec)
+			return nil, nil, fmt.Errorf("-copy %q: want HOST_PATH:GUEST_PATH", spec)
 		}
 		if !path.IsAbs(guest) {
-			return nil, fmt.Errorf("-copy %q: guest path must be absolute", spec)
+			return nil, nil, fmt.Errorf("-copy %q: guest path must be absolute", spec)
 		}
 		st, err := os.Stat(host)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if !st.Mode().IsRegular() {
-			return nil, fmt.Errorf("-copy %q: only regular files can be copied", spec)
+		switch {
+		case st.IsDir():
+			tmp, err := os.CreateTemp("", "ksar-copy-*.tar")
+			if err != nil {
+				return nil, nil, err
+			}
+			os.Remove(tmp.Name()) // gone from the filesystem; the fd keeps it alive
+			bw := bufio.NewWriterSize(tmp, 1<<20)
+			ps, err := sandbox.PackDir(bw, host)
+			if err == nil {
+				err = bw.Flush()
+			}
+			if err == nil {
+				_, err = tmp.Seek(0, io.SeekStart)
+			}
+			if err != nil {
+				tmp.Close()
+				return nil, nil, fmt.Errorf("-copy %q: %w", spec, err)
+			}
+			dirs = append(dirs, sandbox.Dir{Path: guest, Tar: bufio.NewReaderSize(tmp, 1<<20)})
+			if verbose {
+				fmt.Fprintf(os.Stderr, "[ksar] %s -> %s: %d files (%s), %d dirs, %d symlinks (not followed), %d special files skipped\n",
+					host, guest, ps.Files, humanBytes(ps.Bytes), ps.Dirs, ps.Symlinks, ps.Skipped)
+			}
+		case st.Mode().IsRegular():
+			data, err := os.ReadFile(host)
+			if err != nil {
+				return nil, nil, err
+			}
+			files = append(files, sandbox.File{Path: guest, Mode: uint32(st.Mode().Perm()), Data: data})
+		default:
+			return nil, nil, fmt.Errorf("-copy %q: only regular files and directories can be copied", spec)
 		}
-		data, err := os.ReadFile(host)
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, sandbox.File{Path: guest, Mode: uint32(st.Mode().Perm()), Data: data})
 	}
-	return files, nil
+	return files, dirs, nil
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 // showTail prints the last lines of the guest console after a failure.
