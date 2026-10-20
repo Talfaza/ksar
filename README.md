@@ -26,6 +26,7 @@ for this purpose.
 - [Requirements](#requirements)
 - [Build](#build)
 - [Usage](#usage)
+- [Web UI](#web-ui)
 - [How it works](#how-it-works)
 - [Security model](#security-model)
 - [Performance](#performance)
@@ -128,6 +129,47 @@ that directory to reclaim space.
 
 Tested with Alpine, Debian, Ubuntu, Fedora and Arch Linux images, all in
 the default 256 MiB.
+
+## Web UI
+
+```sh
+ksar ui            # then open the link it prints
+ksar ui -open      # or let it open the browser
+```
+
+A local control panel to start runs, watch their output live, type to
+their stdin, stop them, and manage images. It looks like this: a runs
+list with status and exit codes; a new-run form with secure defaults; a
+live run page with a terminal (colors kept), the guest kernel log, cgroup
+memory and CPU, and the protections that actually apply to that run; an
+images page that imports from Docker; and settings with system checks.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-addr` | `127.0.0.1:8765` | Listen address. Loopback IPs only; port 0 picks a free one. |
+| `-images DIR` | `~/.local/share/ksar/images` | Directory of root filesystem tars (symlinks allowed). |
+| `-kernel FILE` | auto | Kernel for runs. |
+| `-open` | off | Open the sign-in link with `xdg-open`. |
+
+How it's kept safe:
+
+- **Each run is its own `ksar run` process**, with the same seccomp
+  lockdown and cgroup scope as on the command line. The UI server never
+  runs guest code.
+- **Loopback only**, and the `Host` header must match exactly (stops DNS
+  rebinding).
+- **Startup token:** the printed link sets an `HttpOnly`,
+  `SameSite=Strict` session cookie and redirects to a clean URL. Restart
+  `ksar ui` for a new one.
+- **Origin checks** on every state-changing request, so pages from other
+  websites, or from other servers on your machine (other ports), can't
+  start or stop runs.
+- **Strict Content-Security-Policy**, no framing, nothing loaded from the
+  internet. Guest output is filtered like terminal output, then inserted
+  only as text, never as HTML.
+
+Run history lives in memory while `ksar ui` runs. Stopping the UI stops
+its runs.
 
 ### Other commands
 
@@ -273,7 +315,7 @@ use it with untrusted guests.
 
 | Path | What |
 |---|---|
-| `cmd/ksar` | CLI: `run`, `boot`, `initramfs`, `hello`; cgroup scope; terminal filtering |
+| `cmd/ksar` | CLI: `run`, `ui`, `boot`, `initramfs`, `hello`; cgroup scope; terminal filtering; JSON events for the UI |
 | `cmd/ksar-agent` | Guest agent, PID 1 in the VM |
 | `internal/kvm` | Thin `/dev/kvm` wrapper; struct layouts pinned by tests |
 | `internal/boot` | x86 Linux boot protocol, long mode, CPUID |
@@ -286,18 +328,17 @@ use it with untrusted guests.
 | `internal/initramfs` | cpio (newc) writer, tar import |
 | `internal/harden` | Lockdown: seccomp, no_new_privs, non-dumpable |
 | `internal/termsafe` | Terminal control-sequence filter |
+| `internal/ui` | Web UI server (security checks, run supervisor, SSE streaming) and its embedded page |
 | `kernel/` | Guest kernel config and build script |
 | `PLAN.md` | Design notes and stage-by-stage history |
 
 ## Status and roadmap
 
 Done: KVM VMM, Linux boot, guest agent, own kernel with virtio
-(blk + vsock), EROFS images, hardening.
+(blk + vsock), EROFS images, hardening, local web UI.
 
 Next:
 
-- **Local web UI** to manage and run VMs from the browser (localhost only,
-  startup token, Origin checks, live terminal)
 - Optional networking: off by default, NAT with an egress allowlist
 - Optional display (framebuffer + VNC)
 - Snapshots for faster starts

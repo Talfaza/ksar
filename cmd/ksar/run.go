@@ -63,6 +63,8 @@ Flags:
 	allowRoot := fs.Bool("allow-root", false, "allow running as root (not recommended)")
 	cgroup := fs.String("cgroup", "auto", "run in a systemd scope with memory/CPU/task limits: auto, on or off")
 	raw := fs.Bool("raw", false, "pass guest output to the terminal unfiltered, including control sequences")
+	eventsFD := fs.Int("events-fd", -1, "write machine-readable JSON events to this open file descriptor (for the web UI)")
+	consoleFD := fs.Int("console-fd", -1, "write the guest kernel log to this open file descriptor (for the web UI)")
 	var copies, envs multiFlag
 	fs.Var(&copies, "copy", "copy a host file into the guest: HOST_PATH:GUEST_PATH (repeatable)")
 	fs.Var(&envs, "e", "set an environment variable: KEY=VALUE (repeatable)")
@@ -72,8 +74,10 @@ Flags:
 		fs.Usage()
 		return 2
 	}
+	ev := openEvents(*eventsFD)
 	fail := func(err error) int {
 		fmt.Fprintf(os.Stderr, "ksar: %v\n", err)
+		ev.emit("error", map[string]any{"message": err.Error(), "code": exitKsarError})
 		return exitKsarError
 	}
 	if err := harden.CheckUser(*allowRoot); err != nil {
@@ -125,6 +129,11 @@ Flags:
 	}
 
 	virtioMode := isKsarKernel(kernelData) && !*legacy
+	ev.emit("started", map[string]any{
+		"pid": os.Getpid(), "scope": os.Getenv(scopeEnv), "virtio": virtioMode,
+		"kernel": kernelVersion(kernelData), "mem": memSize, "mem_limit": limits.MemoryMax,
+		"timeout_ms": timeout.Milliseconds(), "lockdown": *lockdown, "image": *image,
+	})
 	opts := sandbox.Options{
 		Virtio:  virtioMode,
 		Kernel:  kernelData,
@@ -182,6 +191,20 @@ Flags:
 	if *verbose {
 		opts.Console = guestOutput(os.Stderr, *raw)
 	}
+	if *consoleFD >= 0 {
+		f := os.NewFile(uintptr(*consoleFD), "console")
+		if f == nil {
+			return fail(fmt.Errorf("-console-fd %d is not open", *consoleFD))
+		}
+		if opts.Console != nil {
+			opts.Console = io.MultiWriter(opts.Console, f)
+		} else {
+			opts.Console = f
+		}
+	}
+	opts.OnReady = func(boot time.Duration, cid uint32) {
+		ev.emit("ready", map[string]any{"boot_ms": boot.Milliseconds(), "cid": cid})
+	}
 	defer func() {
 		removed := 0
 		for _, w := range []io.Writer{stdout, stderr, opts.Console} {
@@ -194,9 +217,17 @@ Flags:
 			fmt.Fprintf(os.Stderr, "ksar: removed %d terminal control sequence(s) from the guest's output (-raw keeps them)\n", removed)
 		}
 	}()
+	code := runSandbox(opts, *verbose, *raw, *timeout, virtioMode, fail)
+	ev.emit("exit", map[string]any{"code": code})
+	return code
+}
+
+// runSandbox runs the VM and maps the outcome to an exit code.
+func runSandbox(opts sandbox.Options, verbose, raw bool, timeout time.Duration, virtioMode bool,
+	fail func(error) int) int {
 
 	res, err := sandbox.Run(opts)
-	if *verbose {
+	if verbose {
 		mode := "legacy (serial)"
 		if virtioMode {
 			mode = "virtio (vsock)"
@@ -205,12 +236,12 @@ Flags:
 			res.Boot.Round(time.Millisecond), res.Total.Round(time.Millisecond), res.VM.Reason)
 	}
 	if errors.Is(err, sandbox.ErrTimeout) {
-		fmt.Fprintf(os.Stderr, "ksar: VM killed after %v timeout\n", *timeout)
+		fmt.Fprintf(os.Stderr, "ksar: VM killed after %v timeout\n", timeout)
 		return exitTimeout
 	}
 	if err != nil {
-		if !*verbose {
-			showTail(res.ConsoleTail, *raw)
+		if !verbose {
+			showTail(res.ConsoleTail, raw)
 		}
 		return fail(err)
 	}

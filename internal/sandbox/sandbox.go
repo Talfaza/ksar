@@ -50,6 +50,10 @@ type Options struct {
 	// restrictions (see package harden).
 	Lockdown func() error
 
+	// OnReady, if set, is called once the guest agent is up, with the
+	// boot time and the VM's vsock CID (0 in legacy mode).
+	OnReady func(boot time.Duration, cid uint32)
+
 	Files  []File
 	Exec   proto.Exec
 	Stdin  io.Reader // nil: empty stdin
@@ -152,7 +156,7 @@ func Run(opts Options) (Result, error) {
 			}
 			ch = c
 		}
-		s.exit, s.boot, s.err = session(ch, opts, start)
+		s.exit, s.boot, s.err = session(ch, opts, start, m.GuestCID())
 	}()
 
 	vmRes, vmErr := m.Run()
@@ -184,12 +188,15 @@ func Run(opts Options) (Result, error) {
 	return res, nil
 }
 
-func session(ch io.ReadWriter, opts Options, start time.Time) (proto.Exit, time.Duration, error) {
+func session(ch io.ReadWriter, opts Options, start time.Time, cid uint32) (proto.Exit, time.Duration, error) {
 	c := agent.NewClient(ch)
 	if _, err := c.WaitReady(); err != nil {
 		return proto.Exit{}, 0, fmt.Errorf("waiting for agent: %w", err)
 	}
 	boot := time.Since(start)
+	if opts.OnReady != nil {
+		opts.OnReady(boot, cid)
+	}
 	for _, f := range opts.Files {
 		if err := c.PutFile(f.Path, f.Mode, bytes.NewReader(f.Data)); err != nil {
 			return proto.Exit{}, boot, err

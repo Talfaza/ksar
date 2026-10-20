@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ksar</title>
+<link rel="icon" type="image/png" href="/mascot.png">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="/mascot.png" alt="" width="28" height="28">
+      <span class="brand-name">Ksar</span>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/runs" data-route="runs"><span class="ico" data-icon="terminal"></span><span>Runs</span><span class="nav-badge" id="nav-active"></span></a>
+      <a href="#/new" data-route="new"><span class="ico" data-icon="plus"></span><span>New run</span><kbd>Ctrl N</kbd></a>
+      <a href="#/images" data-route="images"><span class="ico" data-icon="layers"></span><span>Images</span></a>
+      <a href="#/settings" data-route="settings"><span class="ico" data-icon="sliders"></span><span>Settings</span></a>
+    </nav>
+    <div class="side-status" id="side-status"></div>
+  </aside>
+  <main class="main" id="main" tabindex="-1"></main>
+</div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

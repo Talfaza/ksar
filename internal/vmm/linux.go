@@ -240,6 +240,14 @@ func (m *Machine) addVirtio(mem *virtio.Memory) (string, error) {
 	return cmdline, nil
 }
 
+// GuestCID returns the VM's vsock context ID, or 0 without vsock.
+func (m *Machine) GuestCID() uint32 {
+	if m.vsock == nil {
+		return 0
+	}
+	return m.vsock.CID()
+}
+
 // AgentConn waits for the guest agent to connect over vsock. It fails if
 // the VM stops first. Requires Vsock.
 func (m *Machine) AgentConn() (io.ReadWriteCloser, error) {

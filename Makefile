@@ -3,7 +3,7 @@
 GO ?= go
 AGENT := internal/agentbin/bin/ksar-agent
 
-.PHONY: all ksar agent kernel hello-initramfs boot alpine test fuzz clean distclean
+.PHONY: all ksar agent kernel hello-initramfs boot alpine ui test fuzz clean distclean
 
 all: ksar hello-initramfs
 
@@ -33,6 +33,10 @@ build/bzImage: kernel/ksar.config kernel/build.sh
 # Boot the host kernel with the hello init (stage 2 demo).
 boot: all
 	./ksar boot -initrd build/hello.cpio
+
+# Start the web UI, with build/*.tar as the image library.
+ui: ksar
+	./ksar ui -images build -open
 
 # Export an Alpine Linux image to use with `ksar run -image`.
 alpine: build/alpine.tar

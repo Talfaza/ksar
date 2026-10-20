@@ -40,7 +40,7 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-Status: stages 1-5 done.
+Status: stages 1-6 done.
 
 1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
@@ -82,7 +82,15 @@ Status: stages 1-5 done.
      controls are removed. Pipes/files untouched; -raw disables.
    - Not done: Landlock (per-thread, can't cover Go's existing threads),
      namespaces (would need a separate VMM process).
-6. **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
+6. ✅ **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
+   `ksar ui`: server on 127.0.0.1 (Host check, startup token -> HttpOnly
+   SameSite=Strict cookie, Origin check on mutations, CSP, no framing).
+   Each run is a child `ksar run` (own lockdown + cgroup) reporting JSON
+   events on fd 3 and the guest console on fd 4; output is coalesced,
+   filtered with termsafe and streamed over SSE with resume. Vanilla JS
+   page embedded in the binary, guest output only via textContent.
+   Screens: runs, new run, live run (terminal, kernel log, cgroup metrics,
+   real protections), images (Docker import, cache), settings (checks).
 7. **Optional devices** – networking, then display (framebuffer + VNC/noVNC).
 8. **Snapshots** – save/restore memory + vCPU state for fast starts
    (reseed guest RNG after restore).
