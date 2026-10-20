@@ -12,13 +12,16 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"ksar/internal/agent/proto"
 	"ksar/internal/agentbin"
 	"ksar/internal/harden"
 	imagecache "ksar/internal/image"
 	"ksar/internal/sandbox"
+	"ksar/internal/termsafe"
 )
 
 // Exit codes for failures of ksar itself, following `docker run`.
@@ -49,7 +52,7 @@ Flags:
 	}
 	kernel := fs.String("kernel", findKernel(), "bzImage to boot (default: the Ksar kernel if built, else the host's)")
 	legacy := fs.Bool("legacy", false, "use the serial channel and an in-RAM image even with a Ksar kernel")
-	image := fs.String("image", "", "root filesystem tar, e.g. from `docker export` (default: agent only)")
+	image := fs.String("image", "", "root filesystem tar, e.g. from 'docker export' (default: agent only)")
 	mem := fs.String("mem", "256M", "guest memory")
 	timeout := fs.Duration("timeout", 60*time.Second, "kill the VM after this long (0 = never)")
 	interactive := fs.Bool("i", false, "forward ksar's stdin to the command")
@@ -59,6 +62,7 @@ Flags:
 	lockdown := fs.Bool("lockdown", true, "restrict ksar with seccomp before the guest runs (disable only to debug)")
 	allowRoot := fs.Bool("allow-root", false, "allow running as root (not recommended)")
 	cgroup := fs.String("cgroup", "auto", "run in a systemd scope with memory/CPU/task limits: auto, on or off")
+	raw := fs.Bool("raw", false, "pass guest output to the terminal unfiltered, including control sequences")
 	var copies, envs multiFlag
 	fs.Var(&copies, "copy", "copy a host file into the guest: HOST_PATH:GUEST_PATH (repeatable)")
 	fs.Var(&envs, "e", "set an environment variable: KEY=VALUE (repeatable)")
@@ -170,9 +174,26 @@ Flags:
 	} else {
 		fmt.Fprintln(os.Stderr, "ksar: warning: running without lockdown; a VMM bug would expose this machine")
 	}
+	// Untrusted output headed for a terminal is filtered (pipes and files
+	// get exact bytes). The check must happen before lockdown, which
+	// forbids the ioctl it uses.
+	stdout, stderr := guestOutput(os.Stdout, *raw), guestOutput(os.Stderr, *raw)
+	opts.Stdout, opts.Stderr = stdout, stderr
 	if *verbose {
-		opts.Console = os.Stderr
+		opts.Console = guestOutput(os.Stderr, *raw)
 	}
+	defer func() {
+		removed := 0
+		for _, w := range []io.Writer{stdout, stderr, opts.Console} {
+			if t, ok := w.(*termsafe.Writer); ok {
+				t.Flush()
+				removed += t.Removed()
+			}
+		}
+		if removed > 0 {
+			fmt.Fprintf(os.Stderr, "ksar: removed %d terminal control sequence(s) from the guest's output (-raw keeps them)\n", removed)
+		}
+	}()
 
 	res, err := sandbox.Run(opts)
 	if *verbose {
@@ -189,7 +210,7 @@ Flags:
 	}
 	if err != nil {
 		if !*verbose {
-			showTail(res.ConsoleTail)
+			showTail(res.ConsoleTail, *raw)
 		}
 		return fail(err)
 	}
@@ -227,7 +248,7 @@ func parseCopies(specs []string) ([]sandbox.File, error) {
 }
 
 // showTail prints the last lines of the guest console after a failure.
-func showTail(tail []byte) {
+func showTail(tail []byte, raw bool) {
 	tail = bytes.TrimSpace(tail)
 	if len(tail) == 0 {
 		return
@@ -237,8 +258,12 @@ func showTail(tail []byte) {
 		lines = lines[len(lines)-25:]
 	}
 	fmt.Fprintln(os.Stderr, "ksar: last guest console output:")
+	out := guestOutput(os.Stderr, raw)
 	for _, l := range lines {
-		fmt.Fprintln(os.Stderr, "  | "+strings.TrimRight(l, "\r"))
+		fmt.Fprintln(out, "  | "+strings.TrimRight(l, "\r"))
+	}
+	if t, ok := out.(*termsafe.Writer); ok {
+		t.Flush()
 	}
 }
 
@@ -292,4 +317,20 @@ func isKsarKernelFile(path string) bool {
 	head := make([]byte, 64<<10)
 	n, _ := io.ReadFull(f, head)
 	return isKsarKernel(head[:n])
+}
+
+// guestOutput wraps f in a control-sequence filter when it is a terminal
+// and raw is not set.
+func guestOutput(f *os.File, raw bool) io.Writer {
+	if raw || !isTerminal(f) {
+		return f
+	}
+	return termsafe.NewWriter(f)
+}
+
+// isTerminal reports whether f is a tty (TCGETS succeeds).
+func isTerminal(f *os.File) bool {
+	var t syscall.Termios
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
+	return e == 0
 }

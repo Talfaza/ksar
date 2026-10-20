@@ -77,9 +77,11 @@ Status: stages 1-5 done.
      root. ksar is static Go (cgo builds refuse lockdown).
    - Cgroups via a systemd user scope: memory = guest + 256 MiB, no swap,
      256 tasks, 150% CPU (auto; falls back without systemd).
+   - Terminal output filter (internal/termsafe): on a tty, only text and
+     SGR colors pass; OSC (clipboard, title), cursor movement, resets, C1
+     controls are removed. Pipes/files untouched; -raw disables.
    - Not done: Landlock (per-thread, can't cover Go's existing threads),
-     namespaces (would need a separate VMM process); sanitizing terminal
-     escape sequences in guest output.
+     namespaces (would need a separate VMM process).
 6. **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
 7. **Optional devices** – networking, then display (framebuffer + VNC/noVNC).
 8. **Snapshots** – save/restore memory + vCPU state for fast starts

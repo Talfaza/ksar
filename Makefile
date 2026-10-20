@@ -47,7 +47,8 @@ test: agent
 # Fuzz every parser of guest- or image-controlled input. FUZZTIME per target.
 FUZZTIME ?= 30s
 FUZZ_TARGETS := virtio:FuzzQueue virtio:FuzzBlock virtio:FuzzMMIO devices:FuzzSerial \
-	devices:FuzzPortBus agent/proto:FuzzReadFrame initramfs:FuzzAddTar boot:FuzzLoad
+	devices:FuzzPortBus agent/proto:FuzzReadFrame initramfs:FuzzAddTar boot:FuzzLoad \
+	termsafe:FuzzFilter
 fuzz:
 	@for t in $(FUZZ_TARGETS); do \
 		pkg=$${t%%:*}; fn=$${t#*:}; echo ">> $$fn"; \
