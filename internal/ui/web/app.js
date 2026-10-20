@@ -275,6 +275,96 @@ async function stopRun(id) {
   try { await api('POST', '/api/runs/' + id + '/stop'); toast('Stopping run #' + id); } catch (e) { toast(e.message, 'err'); }
 }
 
+// ---------- Memory picker ----------
+
+const MEM_MIN = 64;
+const MEM_MAX = 3072;
+const MEM_PRESETS = [
+  [128, '128 MB', 'Enough for shell scripts and small tools.'],
+  [256, '256 MB', 'Most command-line tools and short scripts.'],
+  [512, '512 MB', 'Python, Node and package managers.'],
+  [1024, '1 GB', 'Builds, test suites, larger interpreters.'],
+  [2048, '2 GB', 'Compilers and bigger datasets.'],
+  [3072, '3 GB', 'The maximum for one VM.'],
+];
+
+function fmtMem(mb) { return mb >= 1024 && mb % 1024 === 0 ? mb / 1024 + ' GB' : mb + ' MB'; }
+
+// memoryPicker: preset buttons plus an exact custom size in MB. Calls
+// onChange with valid values only; an out-of-range entry is shown as an
+// error while typing and clamped when the field loses focus.
+function memoryPicker(initial, onChange, defaultMB) {
+  let value = initial;
+  const presets = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Guest memory' });
+  const input = h('input', {
+    class: 'input', type: 'number', min: MEM_MIN, max: MEM_MAX, step: 1, inputMode: 'numeric',
+    'aria-label': 'Guest memory in MB', 'aria-describedby': 'mem-hint',
+  });
+  const hint = h('p', { class: 'hint', id: 'mem-hint' });
+  const err = h('p', { class: 'field-error', role: 'alert' });
+
+  const valid = v => Number.isInteger(v) && v >= MEM_MIN && v <= MEM_MAX;
+  function render(keepInput) {
+    clear(presets);
+    for (const [mb, label] of MEM_PRESETS) {
+      const on = mb === value;
+      presets.append(h('button', {
+        type: 'button', class: 'seg-btn' + (on ? ' on' : ''), role: 'radio', 'aria-checked': String(on),
+        tabIndex: on || (!MEM_PRESETS.some(p => p[0] === value) && mb === 256) ? 0 : -1,
+        onclick: () => set(mb), onkeydown: arrowKeys,
+      }, label, mb === defaultMB ? h('span', { class: 'seg-tag' }, 'default') : null));
+    }
+    if (!keepInput) input.value = value;
+    input.classList.remove('invalid');
+    err.textContent = '';
+    const preset = MEM_PRESETS.find(p => p[0] === value);
+    hint.textContent = (preset ? preset[2] : 'Custom size: ' + fmtMem(value) + '.') +
+      ' Files the command writes are kept in this memory too.';
+  }
+  function set(v, keepInput) {
+    value = v;
+    render(keepInput);
+    onChange(v);
+  }
+  function arrowKeys(e) {
+    const i = MEM_PRESETS.findIndex(p => p[0] === value);
+    let j = null;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') j = Math.min(MEM_PRESETS.length - 1, i + 1);
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') j = Math.max(0, i < 0 ? 0 : i - 1);
+    if (j === null) return;
+    e.preventDefault();
+    set(MEM_PRESETS[j][0]);
+    presets.children[j].focus();
+  }
+  input.addEventListener('input', () => {
+    const v = Number(input.value);
+    if (valid(v)) { set(v, true); return; }
+    input.classList.add('invalid');
+    err.textContent = input.value === '' ? 'Enter a size in MB.' : 'Choose between ' + MEM_MIN + ' MB and ' + fmtMem(MEM_MAX) + ', in whole MB.';
+  });
+  // Leaving the field (blur) or committing it (Enter, which fires
+  // change) snaps an out-of-range entry to the nearest allowed size.
+  const commit = () => {
+    const v = Math.round(Number(input.value));
+    set(Number.isFinite(v) && input.value !== '' ? Math.min(MEM_MAX, Math.max(MEM_MIN, v)) : value);
+  };
+  input.addEventListener('blur', commit);
+  input.addEventListener('change', commit);
+  const step = d => () => set(Math.min(MEM_MAX, Math.max(MEM_MIN, value + d)));
+
+  const el = h('div', { class: 'mem-picker' },
+    presets,
+    h('div', { class: 'mem-custom' },
+      h('span', { class: 'small muted' }, 'Exact size'),
+      h('div', { class: 'stepper' },
+        h('button', { type: 'button', class: 'btn sm', 'aria-label': 'Decrease by 64 MB', onclick: step(-64) }, '−'),
+        input, h('span', { class: 'unit' }, 'MB'),
+        h('button', { type: 'button', class: 'btn sm', 'aria-label': 'Increase by 64 MB', onclick: step(64) }, '+'))),
+    err, hint);
+  render();
+  return { el, set, get value() { return value; } };
+}
+
 // ---------- New run ----------
 
 async function viewNew(main) {
@@ -361,11 +451,7 @@ async function viewNew(main) {
     });
   }
 
-  const memValue = h('span', { class: 'pill ok' });
-  const memSlider = h('input', {
-    type: 'range', min: 64, max: 3072, step: 64, value: form.mem, 'aria-label': 'Guest memory',
-    oninput: e => { form.mem = +e.target.value; renderSummary(); },
-  });
+  const memPicker = memoryPicker(form.mem, v => { form.mem = v; renderSummary(); }, s.mem_mb);
   const timeoutInput = h('input', {
     class: 'input', type: 'number', min: 1, max: 86400, value: form.timeout, 'aria-label': 'Timeout in seconds',
     oninput: e => { form.timeout = +e.target.value; renderSummary(); },
@@ -374,14 +460,13 @@ async function viewNew(main) {
   const runBtn = h('button', { class: 'btn primary big', type: 'button', onclick: submit }, icon('bolt'), 'Run in sandbox', h('kbd', {}, 'Ctrl ↵'));
 
   function renderSummary() {
-    memValue.textContent = form.mem + ' MB' + (form.mem === s.mem_mb ? ' (default)' : '');
     clear(summary);
     const lines = [
       ['Hypervisor', 'KVM, 1 vCPU'],
       ['Guest kernel', app.status?.kernel_version || 'default'],
       ['Root filesystem', form.image ? imageLabel(form.image) + (app.status?.ksar_kernel ? ' (read-only EROFS + RAM overlay)' : ' (unpacked into RAM)') : 'agent only'],
       ['Network', 'none: no network device'],
-      ['Memory', form.mem + ' MB guest RAM'],
+      ['Memory', fmtMem(form.mem) + ' guest RAM'],
       ['Timeout', form.timeout + ' s, then the VM is killed'],
       ['Files copied in', String(form.files.length)],
       ['Afterwards', 'VM destroyed, nothing kept'],
@@ -427,8 +512,7 @@ async function viewNew(main) {
           drop, fileInput, fileList),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, icon('cpu'), h('h2', {}, 'Resources')),
-          h('div', { class: 'field' }, h('div', { class: 'row' }, h('span', { class: 'label' }, 'Guest memory'), h('span', { class: 'spacer' }), memValue),
-            memSlider, h('div', { class: 'row small faint' }, h('span', {}, '64 MB'), h('span', { class: 'spacer' }), h('span', {}, '3 GB'))),
+          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory'), memPicker.el),
           h('div', { class: 'field' }, h('span', { class: 'label' }, 'Timeout (seconds)'), timeoutInput,
             h('span', { class: 'hint' }, 'The VM is killed when it runs this long. Exit code 124.'))),
         h('section', { class: 'card' },
@@ -832,7 +916,8 @@ function viewImages(main) {
 async function viewSettings(main) {
   let st, s;
   try { [st, s] = await Promise.all([api('GET', '/api/status'), api('GET', '/api/settings')]); } catch (e) { toast(e.message, 'err'); return; }
-  const mem = h('input', { class: 'input', type: 'number', min: 64, max: 3072, step: 64, value: s.mem_mb });
+  let memMB = s.mem_mb;
+  const mem = memoryPicker(s.mem_mb, v => { memMB = v; }, 256);
   const timeout = h('input', { class: 'input', type: 'number', min: 1, max: 86400, value: s.timeout_s });
   const check = (ok, label, detail) => h('div', { class: 'prot ' + (ok ? 'ok' : 'warn') }, icon(ok ? 'check' : 'alert'),
     h('div', {}, h('div', { class: 't' }, label), h('div', { class: 'd' }, detail)));
@@ -844,19 +929,18 @@ async function viewSettings(main) {
       h('div', { class: 'stack' },
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, icon('sliders'), h('h2', {}, 'Defaults for new runs')),
-          h('div', { class: 'tiles' },
-            h('label', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory (MB)'), mem),
-            h('label', { class: 'field' }, h('span', { class: 'label' }, 'Timeout (seconds)'), timeout)),
+          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory'), mem.el),
+          h('label', { class: 'field', style: 'max-width:260px' }, h('span', { class: 'label' }, 'Timeout (seconds)'), timeout),
           h('div', { class: 'row' },
             h('button', {
               class: 'btn primary', onclick: async () => {
                 try {
-                  app.settings = await api('PUT', '/api/settings', { mem_mb: +mem.value, timeout_s: +timeout.value });
+                  app.settings = await api('PUT', '/api/settings', { mem_mb: memMB, timeout_s: +timeout.value });
                   toast('Defaults saved');
                 } catch (e) { toast(e.message, 'err'); }
               },
             }, icon('check'), 'Save'),
-            h('button', { class: 'btn', onclick: () => { mem.value = 256; timeout.value = 60; } }, 'Reset to secure defaults'))),
+            h('button', { class: 'btn', onclick: () => { mem.set(256); timeout.value = 60; } }, 'Reset to secure defaults'))),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, icon('lock'), h('h2', {}, 'How this page is protected')),
           h('div', { class: 'kv' }, h('span', {}, 'Listening on'), h('span', {}, st.addr)),
