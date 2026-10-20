@@ -2,26 +2,24 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>Ksar</title>
 <link rel="icon" type="image/png" href="/mascot.png">
 <link rel="stylesheet" href="/app.css">
+<script src="/motion.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
 <div class="app">
-  <aside class="sidebar">
-    <div class="brand">
-      <img src="/mascot.png" alt="" width="28" height="28">
-      <span class="brand-name">Ksar</span>
-    </div>
-    <nav class="nav" id="nav">
-      <a href="#/runs" data-route="runs"><span class="ico" data-icon="terminal"></span><span>Runs</span><span class="nav-badge" id="nav-active"></span></a>
-      <a href="#/new" data-route="new"><span class="ico" data-icon="plus"></span><span>New run</span><kbd>Ctrl N</kbd></a>
-      <a href="#/images" data-route="images"><span class="ico" data-icon="layers"></span><span>Images</span></a>
-      <a href="#/settings" data-route="settings"><span class="ico" data-icon="sliders"></span><span>Settings</span></a>
+  <aside class="sidebar" aria-label="Ksar">
+    <div class="brand"><img src="/mascot.png" alt="" width="30" height="30"><b>Ksar</b></div>
+    <nav class="nav" id="nav" aria-label="Sections">
+      <a href="#/runs" data-route="runs"><span data-icon="terminal"></span><span>Runs</span><span class="count" id="nav-active" aria-label="active runs"></span></a>
+      <a href="#/images" data-route="images"><span data-icon="layers"></span><span>Images</span></a>
+      <a href="#/settings" data-route="settings"><span data-icon="sliders"></span><span>Settings</span></a>
     </nav>
-    <div class="side-status" id="side-status"></div>
+    <div class="side-status" id="side-status" aria-live="polite"></div>
   </aside>
   <main class="main" id="main" tabindex="-1"></main>
 </div>

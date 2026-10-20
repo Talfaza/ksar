@@ -1,7 +1,13 @@
 // Ksar web UI. Plain JavaScript, no dependencies, nothing loaded from
 // outside. Untrusted data (guest output, file names, commands, errors) is
 // only ever inserted with textContent: there is no innerHTML anywhere.
+//
+// Motion follows Apple's fluid-interface principles (motion.js): springs
+// that start from the on-screen value, inherit gesture velocity, project
+// momentum, rubber-band at edges, and can be grabbed or reversed mid-flight.
 'use strict';
+
+const { Spring, motion, project, rubberband, VelocityTracker, reducedMotion } = KsarMotion;
 
 // ---------- DOM helpers ----------
 
@@ -13,18 +19,18 @@ const ICONS = {
   sliders: 'M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6',
   shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4',
   shieldOff: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM12 8v5M12 16v.01',
-  stop: 'M6 6h12v12H6z',
-  play: 'M6 4l14 8-14 8V4z',
+  stop: 'M7 7h10v10H7z',
+  play: 'M7 4.5l12 7.5-12 7.5z',
   trash: 'M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6',
   copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
   check: 'M20 6L9 17l-5-5',
+  checkCircle: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM8 12l3 3 5-6',
   x: 'M18 6L6 18M6 6l12 12',
   upload: 'M12 16V4M7 9l5-5 5 5M4 20h16',
   download: 'M12 4v12M7 11l5 5 5-5M4 20h16',
-  clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2',
   cpu: 'M6 6h12v12H6zM10 10h4v4h-4zM10 2v4M14 2v4M10 18v4M14 18v4M2 10h4M2 14h4M18 10h4M18 14h4',
-  arrowLeft: 'M19 12H5M12 19l-7-7 7-7',
-  refresh: 'M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5',
+  chevronLeft: 'M15 18l-6-6 6-6',
+  chevronRight: 'M9 18l6-6-6-6',
   lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4',
   alert: 'M12 3L2 20h20L12 3zM12 10v4M12 17v.01',
   bolt: 'M13 2L4 14h7l-1 8 9-12h-7l1-8z',
@@ -34,11 +40,12 @@ const ICONS = {
   replay: 'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5',
   info: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 11v6M12 7v.01',
   wrap: 'M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7',
+  search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3',
 };
 
-function icon(name) {
+function icon(name, cls) {
   const span = document.createElement('span');
-  span.className = 'ico';
+  span.className = 'ico' + (cls ? ' ' + cls : '');
   const svg = document.createElementNS(SVG_NS, 'svg');
   svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('fill', 'none');
@@ -54,8 +61,7 @@ function icon(name) {
   return span;
 }
 
-// h(tag, props, ...children). Strings become text nodes. props: class,
-// on* handlers, dataset, and plain properties/attributes.
+// h(tag, props, ...children). Strings become text nodes; null/false skip.
 function h(tag, props, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
@@ -66,27 +72,18 @@ function h(tag, props, ...children) {
     else if (k in el && k !== 'list') el[k] = v;
     else el.setAttribute(k, v === true ? '' : v);
   }
-  for (const c of children.flat()) {
+  put(el, children);
+  return el;
+}
+function put(el, ...kids) {
+  for (const c of kids.flat(Infinity)) {
     if (c === null || c === undefined || c === false) continue;
     el.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
   return el;
 }
-
 function clear(el) { while (el.firstChild) el.firstChild.remove(); }
-
-// put appends children, skipping null/undefined/false (plain append would
-// insert them as the text "null").
-function put(el, ...kids) {
-  el.append(...kids.flat().filter(k => k !== null && k !== undefined && k !== false));
-}
-
-function toast(msg, kind) {
-  const t = h('div', { class: 'toast' + (kind === 'err' ? ' err' : '') },
-    icon(kind === 'err' ? 'alert' : 'check'), h('span', {}, msg));
-  document.getElementById('toasts').append(t);
-  setTimeout(() => t.remove(), kind === 'err' ? 6000 : 3000);
-}
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 // ---------- API ----------
 
@@ -115,11 +112,11 @@ function fmtBytes(n) {
 }
 function fmtDuration(ms) {
   if (ms < 0) ms = 0;
-  if (ms < 1000) return ms + ' ms';
+  if (ms < 1000) return Math.round(ms) + ' ms';
   const s = ms / 1000;
   if (s < 60) return s.toFixed(1) + ' s';
   const m = Math.floor(s / 60);
-  return m + 'm ' + Math.floor(s % 60) + 's';
+  return m + ' min ' + Math.floor(s % 60) + ' s';
 }
 function fmtClock(ms) {
   const s = Math.max(0, ms) / 1000;
@@ -127,92 +124,511 @@ function fmtClock(ms) {
 }
 function fmtAgo(iso) {
   const d = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (d < 5) return 'just now';
-  if (d < 60) return Math.floor(d) + 's ago';
-  if (d < 3600) return Math.floor(d / 60) + 'm ago';
-  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
-  return Math.floor(d / 86400) + 'd ago';
+  if (d < 5) return 'Just now';
+  if (d < 60) return Math.floor(d) + ' s ago';
+  if (d < 3600) return Math.floor(d / 60) + ' min ago';
+  if (d < 86400) return Math.floor(d / 3600) + ' h ago';
+  return Math.floor(d / 86400) + ' d ago';
+}
+function fmtMem(mb) { return mb >= 1024 && mb % 1024 === 0 ? mb / 1024 + ' GB' : mb + ' MB'; }
+function fmtSecs(s) {
+  if (s % 3600 === 0) return s / 3600 + ' h';
+  if (s % 60 === 0) return s / 60 + ' min';
+  return s + ' s';
 }
 const STATUS_LABEL = {
   booting: 'Booting', running: 'Running', succeeded: 'Succeeded', failed: 'Failed',
   timed_out: 'Timed out', stopped: 'Stopped', error: 'Ksar error',
 };
-function statusPill(status, extra) {
-  return h('span', { class: 'pill ' + status }, h('span', { class: 'dot' }),
-    STATUS_LABEL[status] || status, extra ? ' (' + extra + ')' : '');
+function statusEl(status, code) {
+  const extra = code !== undefined && code !== null && status !== 'succeeded' && status !== 'running' && status !== 'booting' ? ' · ' + code : '';
+  return h('span', { class: 'status ' + status }, h('span', { class: 'dot' }), (STATUS_LABEL[status] || status) + extra);
 }
 const isLive = s => s === 'booting' || s === 'running';
 function runDuration(r) {
   const end = r.ended ? new Date(r.ended).getTime() : Date.now();
   return end - new Date(r.created).getTime();
 }
-function imageLabel(name) { return name ? name.replace(/\.tar$/, '') : 'agent only'; }
+function imageLabel(name) { return name ? name.replace(/\.tar$/, '') : 'Agent only'; }
 
-// ---------- App state & routing ----------
+// ---------- Toasts: materialize, exit the way they came, swipe away ----------
 
-const app = { status: null, settings: null, timers: [], cleanup: [], prefill: null };
+function toast(msg, kind) {
+  const el = h('div', { class: 'toast' + (kind === 'err' ? ' err' : ''), role: kind === 'err' ? 'alert' : 'status' },
+    icon(kind === 'err' ? 'alert' : 'checkCircle'), h('span', {}, msg));
+  document.getElementById('toasts').append(el);
+  const m = motion(el);
+  const blur = new Spring({ value: 8, precision: 0.05, onUpdate: v => { el.style.filter = v > 0.05 ? `blur(${v}px)` : ''; } });
+  blur.instantWhenReduced = true;
+  m.set({ y: 20, scale: 0.92, opacity: 0 });
+  m.to({ y: 0, scale: 1, opacity: 1 }, { damping: 1, response: 0.35 });
+  blur.to(0, { damping: 1, response: 0.3 });
 
+  let gone = false;
+  const dismiss = (vx = 0) => {
+    if (gone) return;
+    gone = true;
+    const out = vx ? { x: Math.sign(vx) * (el.offsetWidth + 60), opacity: 0 } : { y: 20, scale: 0.94, opacity: 0 };
+    blur.to(vx ? 0 : 6, { damping: 1, response: 0.3 });
+    m.to(out, { damping: 1, response: 0.32, velocity: { x: vx } }).then(() => el.remove());
+  };
+  let timer = setTimeout(dismiss, kind === 'err' ? 6000 : 3200);
+
+  // Swipe sideways to dismiss: 1:1 tracking, momentum decides.
+  let drag = null;
+  el.addEventListener('pointerdown', e => {
+    drag = { id: e.pointerId, sx: e.clientX, x0: m.state.x, vt: new VelocityTracker() };
+    el.setPointerCapture(e.pointerId);
+    m.springs.x.stop();
+    clearTimeout(timer);
+  });
+  el.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const x = drag.x0 + e.clientX - drag.sx;
+    m.set({ x, opacity: clamp(1 - Math.abs(x) / (el.offsetWidth * 1.2), 0.2, 1) });
+    drag.vt.add(e.clientX, 0);
+  });
+  el.addEventListener('pointerup', release);
+  el.addEventListener('pointercancel', release);
+  function release(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const vx = drag.vt.velocity().x;
+    drag = null;
+    const landing = m.state.x + project(vx);
+    if (Math.abs(landing) > 120) dismiss(vx || Math.sign(m.state.x) * 600);
+    else {
+      m.to({ x: 0, opacity: 1 }, { velocity: { x: vx }, damping: 0.8, response: 0.3 });
+      timer = setTimeout(dismiss, 2500);
+    }
+  }
+}
+
+// ---------- Segmented control: spring thumb you can drag and flick ----------
+
+// segmented(items, value, onChange, {label, large}) where items are
+// {value, label, tag?, count?}. A value that matches no item hides the
+// thumb (e.g. a custom number).
+function segmented(items, value, onChange, opts = {}) {
+  const root = h('div', { class: 'seg' + (opts.large ? ' large' : ''), role: 'radiogroup', 'aria-label': opts.label || null });
+  const thumb = h('div', { class: 'seg-thumb', 'aria-hidden': 'true' });
+  root.append(thumb);
+  const counts = [];
+  const btns = items.map((it, i) => {
+    const n = it.count !== undefined ? h('span', { class: 'n' }, String(it.count)) : null;
+    counts.push(n);
+    const b = h('button', { type: 'button', class: 'seg-item', role: 'radio' },
+      it.label, it.tag ? h('span', { class: 'tag' }, it.tag) : null, n);
+    b.addEventListener('click', () => select(i, { commit: true }));
+    b.addEventListener('keydown', e => {
+      const d = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      const j = clamp((index < 0 ? 0 : index) + d, 0, btns.length - 1);
+      select(j, { commit: true });
+      btns[j].focus();
+    });
+    root.append(b);
+    return b;
+  });
+  let index = items.findIndex(it => it.value === value);
+
+  const x = new Spring({ value: 0, precision: 0.1, onUpdate: v => { thumb.style.transform = `translateX(${v}px)`; } });
+  const w = new Spring({ value: 0, precision: 0.1, onUpdate: v => { thumb.style.width = v + 'px'; } });
+  x.instantWhenReduced = w.instantWhenReduced = true;
+  const geom = i => ({ left: btns[i].offsetLeft, width: btns[i].offsetWidth });
+  function place(i, o = {}) {
+    root.classList.toggle('no-thumb', i < 0);
+    if (i < 0 || !btns[i].offsetWidth) return;
+    const g = geom(i);
+    if (o.jump) { x.jump(g.left); w.jump(g.width); return; }
+    x.to(g.left, { velocity: o.velocity, damping: o.damping ?? 1, response: 0.32 });
+    w.to(g.width, { damping: 1, response: 0.32 });
+  }
+  function mark(i) {
+    btns.forEach((b, j) => {
+      b.setAttribute('aria-checked', String(j === i));
+      b.tabIndex = j === i || (i < 0 && j === 0) ? 0 : -1;
+    });
+  }
+  function select(i, o = {}) {
+    index = i;
+    mark(i);
+    place(i, o);
+    if (o.commit && onChange) onChange(items[i].value);
+  }
+  const nearest = cx => {
+    let best = 0, bd = Infinity;
+    btns.forEach((b, j) => { const d = Math.abs(b.offsetLeft + b.offsetWidth / 2 - cx); if (d < bd) { bd = d; best = j; } });
+    return best;
+  };
+
+  // Drag the thumb: grab where you touched it, follow 1:1, resist past the
+  // ends, and on release land where the flick was heading.
+  let drag = null;
+  root.addEventListener('pointerdown', e => {
+    const b = e.target.closest('.seg-item');
+    if (e.button !== 0 || !b || btns.indexOf(b) !== index || index < 0) return;
+    drag = { id: e.pointerId, grab: e.clientX - x.value, sx: e.clientX, vt: new VelocityTracker(), moved: false, hover: index };
+    drag.vt.add(e.clientX, 0);
+  });
+  root.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    if (!drag.moved) {
+      if (Math.abs(e.clientX - drag.sx) < 4) return; // hysteresis: a click, not a drag
+      drag.moved = true;
+      root.setPointerCapture(e.pointerId);
+      root.classList.add('dragging');
+      x.stop();
+    }
+    const min = geom(0).left, max = geom(btns.length - 1).left;
+    let nx = e.clientX - drag.grab;
+    if (nx < min) nx = min + rubberband(nx - min, root.offsetWidth);
+    if (nx > max) nx = max + rubberband(nx - max, root.offsetWidth);
+    x.jump(nx);
+    drag.vt.add(e.clientX, 0);
+    const near = nearest(nx + w.value / 2);
+    if (near !== drag.hover) { drag.hover = near; mark(near); w.to(geom(near).width, { damping: 1, response: 0.25 }); }
+  });
+  const end = e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag;
+    drag = null;
+    if (!d.moved) return; // let the click handler run
+    root.classList.remove('dragging');
+    const v = d.vt.velocity().x;
+    const i = nearest(x.value + w.value / 2 + project(v, 0.99));
+    // Bounce only because the gesture carried momentum.
+    select(i, { commit: true, velocity: v, damping: Math.abs(v) > 300 ? 0.8 : 1 });
+    // The click that follows a drag must not re-select.
+    const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+    root.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => root.removeEventListener('click', swallow, { capture: true }), 0);
+  };
+  root.addEventListener('pointerup', end);
+  root.addEventListener('pointercancel', end);
+
+  new ResizeObserver(() => { if (!drag) place(index, { jump: true }); }).observe(root);
+  mark(index);
+  return {
+    el: root,
+    set(v) { const i = items.findIndex(it => it.value === v); index = i; mark(i); place(i); },
+    setCount(i, n) { if (counts[i]) counts[i].textContent = String(n); requestAnimationFrame(() => place(index)); },
+    get value() { return index >= 0 ? items[index].value : null; },
+  };
+}
+
+// ---------- Value picker: presets + exact value ----------
+
+// picker({presets: [[value, label, hint]], value, min, max, step, unit,
+// defaultValue, describe(v), onChange(v)}). Out-of-range typing shows an
+// inline error and keeps the last valid value; leaving the field snaps it
+// into range.
+function picker(o) {
+  let value = o.value;
+  const hint = h('p', { class: 't-foot', style: 'margin:0' });
+  const err = h('p', { class: 'field-error', role: 'alert' });
+  const seg = segmented(o.presets.map(([v, label]) => ({ value: v, label, tag: v === o.defaultValue ? 'default' : null })),
+    value, v => set(v), { label: o.label });
+  const input = h('input', {
+    class: 'input', type: 'number', min: o.min, max: o.max, step: 1, inputMode: 'numeric', 'aria-label': o.label + ' (' + o.unit + ')',
+  });
+  const valid = v => Number.isInteger(v) && v >= o.min && v <= o.max;
+  function render(keepInput) {
+    if (!keepInput) input.value = value;
+    input.classList.remove('invalid');
+    err.textContent = '';
+    seg.set(value);
+    const p = o.presets.find(x => x[0] === value);
+    hint.textContent = (p && p[2]) || o.describe(value);
+  }
+  function set(v, keepInput) { value = v; render(keepInput); o.onChange(v); }
+  input.addEventListener('input', () => {
+    const v = Number(input.value);
+    if (valid(v)) { set(v, true); return; }
+    input.classList.add('invalid');
+    err.textContent = input.value === '' ? 'Enter a value.' : 'Choose between ' + o.min + ' and ' + o.max + ' ' + o.unit + '.';
+  });
+  const commit = () => {
+    const v = Math.round(Number(input.value));
+    set(Number.isFinite(v) && input.value !== '' ? clamp(v, o.min, o.max) : value);
+  };
+  input.addEventListener('blur', commit);
+  input.addEventListener('change', commit);
+  const step = d => () => set(clamp(value + d, o.min, o.max));
+  render();
+  return {
+    el: h('div', { class: 'stack', style: 'gap:0.6rem' },
+      seg.el,
+      h('div', { class: 'row wrap' },
+        h('span', { class: 't-sub' }, 'Exact'),
+        h('div', { class: 'stepper' },
+          h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Decrease', onclick: step(-o.step) }, '−'),
+          input, h('span', { class: 'unit' }, o.unit),
+          h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Increase', onclick: step(o.step) }, '+'))),
+      err, hint),
+    set(v) { set(v); },
+    get value() { return value; },
+  };
+}
+
+const MEM_PRESETS = [
+  [128, '128 MB', 'Enough for shell scripts and small tools.'],
+  [256, '256 MB', 'Most command-line tools and short scripts.'],
+  [512, '512 MB', 'Python, Node and package managers.'],
+  [1024, '1 GB', 'Builds, test suites, larger interpreters.'],
+  [2048, '2 GB', 'Compilers and bigger datasets.'],
+  [3072, '3 GB', 'The maximum for one VM.'],
+];
+const TIMEOUT_PRESETS = [
+  [30, '30 s', 'Quick checks.'], [60, '1 min', 'Most scripts.'], [300, '5 min', 'Test suites and small builds.'],
+  [900, '15 min', 'Larger builds.'], [3600, '1 h', 'Long jobs.'],
+];
+function memoryPicker(value, onChange, defaultValue) {
+  return picker({
+    presets: MEM_PRESETS, value, min: 64, max: 3072, step: 64, unit: 'MB', label: 'Guest memory', defaultValue, onChange,
+    describe: v => 'Custom size: ' + fmtMem(v) + '. Files the command writes are kept in this memory too.',
+  });
+}
+function timeoutPicker(value, onChange, defaultValue) {
+  return picker({
+    presets: TIMEOUT_PRESETS, value, min: 1, max: 86400, step: 30, unit: 's', label: 'Timeout', defaultValue, onChange,
+    describe: v => 'Custom: ' + fmtSecs(v) + '. The VM is killed when it runs this long (exit code 124).',
+  });
+}
+
+// ---------- Disclosure: spring height, interruptible ----------
+
+function disclosure(title, body, open = false) {
+  const wrap = h('div', { class: 'disclosure-body' }, h('div', { style: 'padding:0 1rem 1rem' }, body));
+  const chev = icon('chevronRight', 'chev');
+  const btn = h('button', { type: 'button', class: 'disclosure-btn', 'aria-expanded': String(open) }, chev, title);
+  const height = new Spring({
+    value: open ? -1 : 0, precision: 0.5,
+    onUpdate: v => { wrap.style.height = v < 0 ? 'auto' : v + 'px'; },
+    onRest: v => { if (v > 0 && isOpen) wrap.style.height = 'auto'; },
+  });
+  height.instantWhenReduced = true;
+  const rot = new Spring({ value: open ? 90 : 0, precision: 0.1, onUpdate: v => { chev.style.transform = `rotate(${v}deg)`; } });
+  rot.instantWhenReduced = true;
+  let isOpen = open;
+  wrap.style.height = open ? 'auto' : '0px';
+  chev.style.transform = `rotate(${open ? 90 : 0}deg)`;
+  btn.addEventListener('click', () => {
+    isOpen = !isOpen;
+    btn.setAttribute('aria-expanded', String(isOpen));
+    // Start from the height on screen right now (it may be mid-flight).
+    const current = wrap.getBoundingClientRect().height;
+    height.value = current;
+    height.to(isOpen ? wrap.scrollHeight : 0, { damping: 1, response: 0.35 });
+    rot.to(isOpen ? 90 : 0, { damping: 1, response: 0.3 });
+  });
+  return h('div', { class: 'group' }, btn, wrap);
+}
+
+// ---------- Sheet: modal, slides up, drag down to dismiss ----------
+
+// openSheet({build(close), onClosed}). Opening dims and pushes back the
+// page; the sheet enters from the bottom and leaves the same way. Drag the
+// grabber or header: it tracks 1:1, rubber-bands upward, and on release
+// a flick downward (projected past a third of its height) dismisses.
+function openSheet({ title, build, onClosed }) {
+  const appEl = document.querySelector('.app');
+  const restoreFocus = document.activeElement;
+  const scrim = h('div', { class: 'scrim' });
+  const closeBtn = h('button', { type: 'button', class: 'btn plain', onclick: () => dismiss() }, 'Cancel');
+  const head = h('div', { class: 'sheet-head' }, h('h2', { class: 't-title', id: 'sheet-title' }, title), h('span', { class: 'spacer' }), closeBtn);
+  const grip = h('div', { class: 'sheet-grip', 'aria-hidden': 'true' });
+  const panel = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title' }, grip, head);
+  const content = build(() => dismiss());
+  put(panel, content);
+  document.body.append(scrim, panel);
+  document.body.classList.add('sheet-open');
+
+  const m = motion(panel);
+  const H = () => panel.offsetHeight || window.innerHeight;
+  const reduce = reducedMotion();
+  let closing = false;
+  m.onChange = st => {
+    const p = reduce ? st.opacity : clamp(1 - st.y / H(), 0, 1);
+    scrim.style.opacity = String(p);
+    if (!reduce) appEl.style.transform = p > 0.002 ? `scale(${1 - 0.03 * p})` : '';
+  };
+  m.set(reduce ? { y: 0, opacity: 0 } : { y: H(), opacity: 1 });
+  m.to({ y: 0, opacity: 1 }, { damping: 1, response: 0.38 });
+
+  let byUser = false;
+  function finish() {
+    panel.remove();
+    scrim.remove();
+    appEl.style.transform = '';
+    document.body.classList.remove('sheet-open');
+    document.removeEventListener('keydown', onKey, true);
+    if (restoreFocus && restoreFocus.focus) restoreFocus.focus({ preventScroll: true });
+    onClosed && onClosed({ byUser });
+  }
+  function close(velocity = 0) {
+    if (closing) return;
+    closing = true;
+    byUser = false;
+    m.to(reduce ? { opacity: 0 } : { y: H() + 24 }, { damping: 1, response: 0.32, velocity: { y: velocity } })
+      .then(() => { if (closing) finish(); });
+  }
+  // A user dismissal updates the URL only once the sheet has actually
+  // closed: grabbed back mid-close, it stays open and nothing changes.
+  function dismiss(velocity) { close(velocity); byUser = true; }
+
+  // Drag to dismiss.
+  let drag = null;
+  for (const handle of [grip, head]) {
+    handle.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('button, input, a')) return;
+      drag = { id: e.pointerId, sy: e.clientY, y0: m.state.y, vt: new VelocityTracker() };
+      handle.setPointerCapture(e.pointerId);
+      m.springs.y.stop(); // grab it wherever it is, even mid-flight
+      closing = false;
+      drag.vt.add(0, e.clientY);
+    });
+    handle.addEventListener('pointermove', e => {
+      if (!drag || e.pointerId !== drag.id) return;
+      let y = drag.y0 + e.clientY - drag.sy;
+      if (y < 0) y = rubberband(y, H());
+      m.set({ y });
+      drag.vt.add(0, e.clientY);
+    });
+    const up = e => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const v = drag.vt.velocity().y;
+      drag = null;
+      if (m.state.y + project(v) > H() / 3) dismiss(v);
+      else m.to({ y: 0 }, { velocity: { y: v }, damping: 0.8, response: 0.3 });
+    };
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  }
+  scrim.addEventListener('click', () => dismiss());
+
+  // Keyboard: Escape closes; Tab stays inside the sheet.
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); dismiss(); return; }
+    if (e.key !== 'Tab') return;
+    const f = Array.from(panel.querySelectorAll('button, input, a[href], [tabindex]:not([tabindex="-1"])')).filter(el => !el.disabled && el.offsetParent);
+    if (!f.length) return;
+    if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
+    else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+  }
+  document.addEventListener('keydown', onKey, true);
+  return { close, panel };
+}
+
+// ---------- App shell, routing and transitions ----------
+
+const app = { status: null, settings: null, cleanup: [], prefill: null, viewKey: null, viewEl: null, sheet: null, lastRoute: '#/runs' };
 function onLeave(fn) { app.cleanup.push(fn); }
 function every(ms, fn) { const t = setInterval(fn, ms); onLeave(() => clearInterval(t)); }
 
+const DEPTH = { runs: 0, run: 1, images: 0, settings: 0 };
+
 function route() {
-  for (const fn of app.cleanup.splice(0)) fn();
-  const parts = (location.hash.replace(/^#\/?/, '') || 'runs').split('/');
-  const main = document.getElementById('main');
-  clear(main);
-  const page = parts[0];
+  const hash = location.hash || '#/runs';
+  const parts = hash.replace(/^#\/?/, '').split('/');
   for (const a of document.querySelectorAll('#nav a')) {
-    a.classList.toggle('active', a.dataset.route === (page === 'run' ? 'runs' : page));
+    a.classList.toggle('active', a.dataset.route === (parts[0] === 'run' ? 'runs' : parts[0]));
   }
-  const views = { runs: viewRuns, new: viewNew, run: m => viewRun(m, parts[1]), images: viewImages, settings: viewSettings };
-  (views[page] || viewRuns)(main);
-  main.focus({ preventScroll: true });
+  if (parts[0] === 'new') {
+    app.sheetFromNav = !!app.viewKey; // opened from within the app (history has a page to return to)
+    if (!app.viewKey) renderView(['runs']);
+    if (!app.sheet) openNewRun();
+    return;
+  }
+  app.lastRoute = hash;
+  if (app.sheet) { app.sheet.close(); app.sheet = null; }
+  renderView(parts);
+}
+
+function renderView(parts) {
+  const key = parts.join('/');
+  if (key === app.viewKey) return;
+  const fromDepth = app.viewKey ? DEPTH[app.viewKey.split('/')[0]] ?? 0 : null;
+  const toDepth = DEPTH[parts[0]] ?? 0;
+  for (const fn of app.cleanup.splice(0)) fn();
+  const main = document.getElementById('main');
+  if (app.viewEl) app.viewEl.remove();
+  const view = h('div', { class: 'view' });
+  main.append(view);
+  app.viewEl = view;
+  app.viewKey = key;
+  const views = { runs: viewRuns, run: v => viewRun(v, parts[1]), images: viewImages, settings: viewSettings };
+  (views[parts[0]] || viewRuns)(view);
   window.scrollTo(0, 0);
+  main.focus({ preventScroll: true });
+
+  // Deeper pages enter from the right and return to the right; siblings
+  // cross-fade. The new view starts moving at once: nothing waits.
+  const m = motion(view);
+  if (fromDepth === null) { m.set({ opacity: 0 }); m.to({ opacity: 1 }, { damping: 1, response: 0.3 }); return; }
+  const dir = Math.sign(toDepth - fromDepth);
+  m.set({ x: dir * 36, opacity: 0 });
+  m.to({ x: 0, opacity: 1 }, { damping: 1, response: 0.38 }).then(() => { view.style.transform = ''; });
+}
+
+// toolbar + large title. The toolbar's material and small title appear
+// once the large title scrolls under it.
+function pageChrome(view, { title, subtitle, back, actions, header }) {
+  const bar = h('div', { class: 'toolbar' },
+    back ? h('a', { class: 'btn plain', href: back.href }, icon('chevronLeft'), back.label) : null,
+    h('span', { class: 'small-title' }, title),
+    h('span', { class: 'spacer' }),
+    actions || null);
+  const large = header || h('h1', { class: 't-large' }, title);
+  const head = header || h('div', { class: 'page-head' }, h('div', {}, large, subtitle ? h('p', { class: 't-sub' }, subtitle) : null));
+  view.append(bar, head);
+  const io = new IntersectionObserver(([e]) => bar.classList.toggle('scrolled', !e.isIntersecting), { rootMargin: '-52px 0px 0px 0px' });
+  io.observe(large);
+  onLeave(() => io.disconnect());
+  return { bar, head };
 }
 
 async function refreshStatus() {
-  try {
-    app.status = await api('GET', '/api/status');
-  } catch { return; }
+  try { app.status = await api('GET', '/api/status'); } catch { return; }
   const st = app.status;
   const box = document.getElementById('side-status');
   clear(box);
   const ready = st.kvm && st.vhost_vsock;
-  box.append(
-    h('div', { class: 'status-card' },
-      h('div', { class: 'status-row' }, h('span', { class: ready ? 'dot-ok' : 'dot-err' }),
-        h('span', {}, ready ? 'KVM ready' : 'KVM unavailable'),
-        st.kernel_version ? h('span', { class: 'faint' }, '· ' + st.kernel_version.replace(/^(\d+\.\d+)\.\d+/, '$1')) : null),
-      h('div', { class: 'status-row' }, icon('lock'),
-        h('span', { class: 'eyebrow' }, st.lockdown ? 'seccomp lockdown on' : 'lockdown off'))),
-    h('div', { class: 'status-addr' }, st.addr));
+  put(box,
+    h('div', { class: 'row' }, h('span', { class: 'status ' + (ready ? 'succeeded' : 'failed') }, h('span', { class: 'dot' }), ready ? 'KVM ready' : 'KVM unavailable')),
+    h('div', { class: 'row t-foot' }, icon('lock'), st.lockdown ? 'Seccomp lockdown on' : 'Lockdown off'),
+    st.kernel_version ? h('div', { class: 't-foot mono' }, st.kernel_version) : null,
+    h('div', { class: 't-foot mono label-3' }, st.addr));
 }
-
 async function refreshActiveBadge() {
   try {
     const runs = await api('GET', '/api/runs');
     const n = runs.filter(r => isLive(r.status)).length;
-    document.getElementById('nav-active').textContent = n ? n + ' active' : '';
+    document.getElementById('nav-active').textContent = n ? String(n) : '';
   } catch { /* ignore */ }
+}
+
+async function stopRun(id) {
+  try { await api('POST', '/api/runs/' + id + '/stop'); toast('Stopping run #' + id); } catch (e) { toast(e.message, 'err'); }
 }
 
 // ---------- Runs ----------
 
-function viewRuns(main) {
-  const filterState = { tab: 'all', q: '' };
-  const tbodyWrap = h('div');
-  const tabs = h('div', { class: 'tabs', role: 'tablist' });
-  const search = h('input', {
-    class: 'input', type: 'search', placeholder: 'Filter by command, image or run id', style: 'max-width:320px',
-    oninput: e => { filterState.q = e.target.value.toLowerCase(); render(); },
+function viewRuns(view) {
+  pageChrome(view, {
+    title: 'Runs', subtitle: 'Each run boots a fresh microVM and destroys it when the command ends. Nothing it writes survives.',
+    actions: h('a', { class: 'btn primary', href: '#/new' }, icon('plus'), 'New Run'),
   });
-  main.append(
-    h('div', { class: 'page-head' },
-      h('div', {}, h('h1', {}, 'Runs'),
-        h('p', { class: 'sub' }, 'Each run boots a fresh microVM and destroys it when the command ends. Nothing it writes survives.')),
-      h('a', { class: 'btn primary', href: '#/new' }, icon('plus'), 'New run')),
-    h('div', { class: 'row wrap', style: 'margin-bottom:14px' }, tabs, h('span', { class: 'spacer' }), search),
-    tbodyWrap);
+  const filter = { tab: 'all', q: '' };
+  const tabs = segmented([
+    { value: 'all', label: 'All', count: 0 }, { value: 'active', label: 'Active', count: 0 },
+    { value: 'succeeded', label: 'Succeeded', count: 0 }, { value: 'failed', label: 'Failed', count: 0 },
+  ], 'all', v => { filter.tab = v; render(); }, { label: 'Filter runs' });
+  const search = h('label', { class: 'command', style: 'height:2.25rem;max-width:20rem;flex:1;border-radius:9px' },
+    icon('search'),
+    h('input', { type: 'search', placeholder: 'Search', 'aria-label': 'Search runs', style: 'height:2.25rem;font-family:var(--font)', oninput: e => { filter.q = e.target.value.toLowerCase(); render(); } }));
+  const body = h('div');
+  view.append(h('div', { class: 'row wrap', style: 'margin-bottom:1rem' }, h('div', { style: 'min-width:22rem' }, tabs.el), h('span', { class: 'spacer' }), search), body);
 
   let runs = [];
   function render() {
@@ -222,48 +638,35 @@ function viewRuns(main) {
       else if (r.status === 'succeeded') counts.succeeded++;
       else counts.failed++;
     }
-    clear(tabs);
-    for (const [id, label] of [['all', 'All'], ['active', 'Active'], ['succeeded', 'Succeeded'], ['failed', 'Failed / stopped']]) {
-      tabs.append(h('button', {
-        class: 'tab' + (filterState.tab === id ? ' active' : ''), role: 'tab',
-        onclick: () => { filterState.tab = id; render(); },
-      }, label, h('span', { class: 'count' }, String(counts[id]))));
-    }
-    const shown = runs.filter(r => {
-      if (filterState.tab === 'active' && !isLive(r.status)) return false;
-      if (filterState.tab === 'succeeded' && r.status !== 'succeeded') return false;
-      if (filterState.tab === 'failed' && (isLive(r.status) || r.status === 'succeeded')) return false;
-      if (!filterState.q) return true;
-      return (r.spec.command + ' ' + r.spec.image + ' ' + r.id).toLowerCase().includes(filterState.q);
-    });
-    clear(tbodyWrap);
+    ['all', 'active', 'succeeded', 'failed'].forEach((k, i) => tabs.setCount(i, counts[k]));
+    clear(body);
     if (!runs.length) {
-      tbodyWrap.append(h('div', { class: 'empty' },
+      body.append(h('div', { class: 'group' }, h('div', { class: 'empty' },
         h('img', { src: '/mascot.png', alt: '' }),
-        h('h2', {}, 'No sandboxes yet'),
-        h('p', {}, 'Every run starts clean inside its own microVM and is destroyed when it ends.'),
-        h('a', { class: 'btn primary', href: '#/new' }, icon('bolt'), 'Start your first run')));
+        h('h2', { class: 't-title' }, 'No runs yet'),
+        h('p', {}, 'Every run starts clean in its own microVM and is destroyed when it ends.'),
+        h('a', { class: 'btn primary', href: '#/new', style: 'margin-top:0.5rem' }, icon('bolt'), 'Start a Run'))));
       return;
     }
-    const rows = shown.map(r => {
-      const exit = r.exit_code === undefined ? '--' : String(r.exit_code);
-      const mem = r.mem_peak || r.mem_current;
-      return h('tr', { class: 'clickable', onclick: () => { location.hash = '#/run/' + r.id; } },
-        h('td', {}, h('div', { class: 'row' }, statusPill(r.status), h('span', { class: 'faint' }, '#' + r.id))),
-        h('td', {}, h('span', { class: 'cmdcell' }, h('span', { style: 'color:var(--primary)' }, '$'), h('span', {}, r.spec.command))),
-        h('td', {}, h('span', { class: 'code' }, imageLabel(r.spec.image))),
-        h('td', { style: 'text-align:center' }, exit),
-        h('td', {}, fmtDuration(runDuration(r))),
-        h('td', { title: 'Peak memory of the run\'s cgroup (guest RAM in use plus ksar itself)' }, mem ? fmtBytes(mem) : '--'),
-        h('td', { class: 'faint' }, fmtAgo(r.created)),
-        h('td', { style: 'text-align:right' }, isLive(r.status)
-          ? h('button', { class: 'btn danger sm', onclick: e => { e.stopPropagation(); stopRun(r.id); } }, icon('stop'), 'Stop')
-          : h('span', { class: 'muted' }, 'Inspect →')));
+    const shown = runs.filter(r => {
+      if (filter.tab === 'active' && !isLive(r.status)) return false;
+      if (filter.tab === 'succeeded' && r.status !== 'succeeded') return false;
+      if (filter.tab === 'failed' && (isLive(r.status) || r.status === 'succeeded')) return false;
+      return !filter.q || (r.spec.command + ' ' + r.spec.image + ' ' + r.id).toLowerCase().includes(filter.q);
     });
-    tbodyWrap.append(h('div', { class: 'table-wrap' }, h('div', { class: 'table-scroll' },
-      h('table', {},
-        h('thead', {}, h('tr', {}, ['Status', 'Command', 'Image', 'Exit', 'Duration', 'Memory', 'Started', ''].map(t => h('th', {}, t)))),
-        h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colSpan: 8, class: 'muted' }, 'No runs match this filter.')))))));
+    const rows = shown.map(r => h('tr', { class: 'clickable', tabIndex: 0, onclick: () => { location.hash = '#/run/' + r.id; }, onkeydown: e => { if (e.key === 'Enter') location.hash = '#/run/' + r.id; } },
+      h('td', {}, statusEl(r.status, r.exit_code)),
+      h('td', {}, h('span', { class: 'cmd', title: r.spec.command }, r.spec.command)),
+      h('td', {}, imageLabel(r.spec.image)),
+      h('td', { class: 'num' }, fmtDuration(runDuration(r))),
+      h('td', { class: 'num', title: 'Peak memory of the run\'s cgroup' }, r.mem_peak || r.mem_current ? fmtBytes(r.mem_peak || r.mem_current) : '—'),
+      h('td', {}, fmtAgo(r.created)),
+      h('td', { style: 'text-align:right' }, isLive(r.status)
+        ? h('button', { class: 'btn danger small', onclick: e => { e.stopPropagation(); stopRun(r.id); } }, icon('stop'), 'Stop')
+        : icon('chevronRight', 'label-3'))));
+    body.append(h('div', { class: 'table-wrap' }, h('div', { class: 'table-scroll' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Status', 'Command', 'Image', 'Duration', 'Memory', 'Started', ''].map((t, i) => h('th', { class: i === 3 || i === 4 ? 'num' : null }, t)))),
+      h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colSpan: 7 }, 'No runs match.')))))));
   }
   async function load() {
     try { runs = await api('GET', '/api/runs'); render(); } catch (e) { toast(e.message, 'err'); }
@@ -272,158 +675,84 @@ function viewRuns(main) {
   every(1000, load);
 }
 
-async function stopRun(id) {
-  try { await api('POST', '/api/runs/' + id + '/stop'); toast('Stopping run #' + id); } catch (e) { toast(e.message, 'err'); }
-}
+// ---------- New run (sheet) ----------
 
-// ---------- Memory picker ----------
-
-const MEM_MIN = 64;
-const MEM_MAX = 3072;
-const MEM_PRESETS = [
-  [128, '128 MB', 'Enough for shell scripts and small tools.'],
-  [256, '256 MB', 'Most command-line tools and short scripts.'],
-  [512, '512 MB', 'Python, Node and package managers.'],
-  [1024, '1 GB', 'Builds, test suites, larger interpreters.'],
-  [2048, '2 GB', 'Compilers and bigger datasets.'],
-  [3072, '3 GB', 'The maximum for one VM.'],
-];
-
-function fmtMem(mb) { return mb >= 1024 && mb % 1024 === 0 ? mb / 1024 + ' GB' : mb + ' MB'; }
-
-// memoryPicker: preset buttons plus an exact custom size in MB. Calls
-// onChange with valid values only; an out-of-range entry is shown as an
-// error while typing and clamped when the field loses focus.
-function memoryPicker(initial, onChange, defaultMB) {
-  let value = initial;
-  const presets = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Guest memory' });
-  const input = h('input', {
-    class: 'input', type: 'number', min: MEM_MIN, max: MEM_MAX, step: 1, inputMode: 'numeric',
-    'aria-label': 'Guest memory in MB', 'aria-describedby': 'mem-hint',
-  });
-  const hint = h('p', { class: 'hint', id: 'mem-hint' });
-  const err = h('p', { class: 'field-error', role: 'alert' });
-
-  const valid = v => Number.isInteger(v) && v >= MEM_MIN && v <= MEM_MAX;
-  function render(keepInput) {
-    clear(presets);
-    for (const [mb, label] of MEM_PRESETS) {
-      const on = mb === value;
-      presets.append(h('button', {
-        type: 'button', class: 'seg-btn' + (on ? ' on' : ''), role: 'radio', 'aria-checked': String(on),
-        tabIndex: on || (!MEM_PRESETS.some(p => p[0] === value) && mb === 256) ? 0 : -1,
-        onclick: () => set(mb), onkeydown: arrowKeys,
-      }, label, mb === defaultMB ? h('span', { class: 'seg-tag' }, 'default') : null));
-    }
-    if (!keepInput) input.value = value;
-    input.classList.remove('invalid');
-    err.textContent = '';
-    const preset = MEM_PRESETS.find(p => p[0] === value);
-    hint.textContent = (preset ? preset[2] : 'Custom size: ' + fmtMem(value) + '.') +
-      ' Files the command writes are kept in this memory too.';
-  }
-  function set(v, keepInput) {
-    value = v;
-    render(keepInput);
-    onChange(v);
-  }
-  function arrowKeys(e) {
-    const i = MEM_PRESETS.findIndex(p => p[0] === value);
-    let j = null;
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') j = Math.min(MEM_PRESETS.length - 1, i + 1);
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') j = Math.max(0, i < 0 ? 0 : i - 1);
-    if (j === null) return;
-    e.preventDefault();
-    set(MEM_PRESETS[j][0]);
-    presets.children[j].focus();
-  }
-  input.addEventListener('input', () => {
-    const v = Number(input.value);
-    if (valid(v)) { set(v, true); return; }
-    input.classList.add('invalid');
-    err.textContent = input.value === '' ? 'Enter a size in MB.' : 'Choose between ' + MEM_MIN + ' MB and ' + fmtMem(MEM_MAX) + ', in whole MB.';
-  });
-  // Leaving the field (blur) or committing it (Enter, which fires
-  // change) snaps an out-of-range entry to the nearest allowed size.
-  const commit = () => {
-    const v = Math.round(Number(input.value));
-    set(Number.isFinite(v) && input.value !== '' ? Math.min(MEM_MAX, Math.max(MEM_MIN, v)) : value);
-  };
-  input.addEventListener('blur', commit);
-  input.addEventListener('change', commit);
-  const step = d => () => set(Math.min(MEM_MAX, Math.max(MEM_MIN, value + d)));
-
-  const el = h('div', { class: 'mem-picker' },
-    presets,
-    h('div', { class: 'mem-custom' },
-      h('span', { class: 'small muted' }, 'Exact size'),
-      h('div', { class: 'stepper' },
-        h('button', { type: 'button', class: 'btn sm', 'aria-label': 'Decrease by 64 MB', onclick: step(-64) }, '−'),
-        input, h('span', { class: 'unit' }, 'MB'),
-        h('button', { type: 'button', class: 'btn sm', 'aria-label': 'Increase by 64 MB', onclick: step(64) }, '+'))),
-    err, hint);
-  render();
-  return { el, set, get value() { return value; } };
-}
-
-// ---------- New run ----------
-
-async function viewNew(main) {
-  const s = app.settings || (app.settings = await api('GET', '/api/settings').catch(() => ({ mem_mb: 256, timeout_s: 60 })));
-  const pre = app.prefill || {};
+function openNewRun() {
+  const prefill = app.prefill || {};
   app.prefill = null;
-  const form = {
-    command: pre.command || '', image: pre.image ?? null, mem: pre.mem_mb || s.mem_mb,
-    timeout: pre.timeout_s || s.timeout_s, workdir: pre.workdir || '', env: (pre.env || []).slice(),
-    files: [], interactive: !!pre.interactive,
-  };
-  let images = [];
-  try { images = (await api('GET', '/api/images')).filter(i => !i.importing && !i.error); } catch { /* none */ }
-  if (form.image === null) form.image = images.length ? images[0].name : '';
-  if (form.image && !images.some(i => i.name === form.image)) form.image = '';
+  const fromNav = app.sheetFromNav;
+  const sheet = openSheet({
+    title: 'New Run',
+    build: close => buildNewRun(prefill, close),
+    onClosed: ({ byUser }) => {
+      if (app.sheet === sheet) app.sheet = null;
+      if (byUser && location.hash === '#/new') {
+        if (fromNav) history.back(); else location.replace(app.lastRoute);
+      }
+    },
+  });
+  app.sheet = sheet;
+}
 
-  const summary = h('div', { class: 'stack' });
+function buildNewRun(pre, close) {
+  const s = app.settings || { mem_mb: 256, timeout_s: 60 };
+  const form = {
+    command: pre.command || '', image: pre.image ?? null, mem: pre.mem_mb || s.mem_mb, timeout: pre.timeout_s || s.timeout_s,
+    workdir: pre.workdir || '', env: (pre.env || []).slice(), files: [], interactive: !!pre.interactive,
+  };
+  const body = h('div', { class: 'sheet-body' });
+  const summary = h('div', { class: 'summary t-sub' });
+  const errBox = h('div');
+  const runBtn = h('button', { class: 'btn primary large', type: 'button', onclick: submit }, 'Run in Sandbox');
+
+  // Command
   const cmdInput = h('input', {
     value: form.command, placeholder: "sh -c 'echo hello from the sandbox'", spellcheck: false, autocomplete: 'off',
     'aria-label': 'Command', oninput: e => { form.command = e.target.value; renderSummary(); },
   });
+  body.append(h('div', { class: 'section' },
+    h('label', { class: 'command' }, h('span', { class: 'prompt' }, '$'), cmdInput),
+    h('p', { class: 't-foot group-foot' }, "Split into words like a shell, without expansion. For pipes or variables, wrap it: sh -c '…'")));
 
-  // Image picker
-  const imageGrid = h('div', { class: 'grid-cards' });
+  // Image
+  const imageGrid = h('div', { class: 'image-grid' });
+  let images = [];
   function renderImages() {
     clear(imageGrid);
-    const choices = [{ name: '', label: 'Agent only', detail: 'No image: only the agent binary' }]
-      .concat(images.map(i => ({ name: i.name, label: imageLabel(i.name), detail: fmtBytes(i.size) + (i.cached ? ' · disk ready' : ' · converted on first run') })));
+    const choices = [{ name: '', label: 'Agent only', detail: 'No filesystem image' }]
+      .concat(images.map(i => ({ name: i.name, label: imageLabel(i.name), detail: fmtBytes(i.size) + (i.cached ? ' · ready' : ' · converted on first run') })));
     for (const c of choices) {
       imageGrid.append(h('button', {
-        type: 'button', class: 'image-card' + (form.image === c.name ? ' selected' : ''), 'aria-pressed': String(form.image === c.name),
+        type: 'button', class: 'image-card pressable', 'aria-pressed': String(form.image === c.name),
         onclick: () => { form.image = c.name; renderImages(); renderSummary(); },
-      }, h('div', { class: 'row' }, icon(c.name ? 'layers' : 'terminal'), h('span', { class: 'name' }, c.label)),
-      h('span', { class: 'small muted' }, c.detail)));
+      }, h('span', { class: 'name' }, c.label), h('span', { class: 't-foot' }, c.detail)));
     }
-    imageGrid.append(h('a', { class: 'image-card', href: '#/images', style: 'border-style:dashed;justify-content:center;align-items:center' },
-      icon('download'), h('span', { class: 'muted' }, 'Import an image…')));
   }
+  api('GET', '/api/images').then(list => {
+    images = list.filter(i => !i.importing && !i.error);
+    if (form.image === null) form.image = images.length ? images[0].name : '';
+    if (form.image && !images.some(i => i.name === form.image)) form.image = '';
+    renderImages(); renderSummary();
+  }, () => { form.image = form.image || ''; renderImages(); });
+  body.append(h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Root filesystem'), imageGrid));
 
   // Files and folders
-  const fileList = h('div', { class: 'stack', style: 'gap:6px' });
-  const uploads = h('div', { class: 'stack', style: 'gap:6px' }); // in progress
+  const fileList = h('div', { class: 'stack', style: 'gap:0.5rem' });
+  const uploads = h('div', { class: 'stack', style: 'gap:0.5rem' });
   const fileInput = h('input', { type: 'file', multiple: true, hidden: true, onchange: e => { uploadFiles(e.target.files); e.target.value = ''; } });
-  const folderInput = h('input', {
-    type: 'file', multiple: true, hidden: true, webkitdirectory: true,
-    onchange: e => { uploadPickedFolder(e.target.files); e.target.value = ''; },
-  });
+  const folderInput = h('input', { type: 'file', multiple: true, hidden: true, webkitdirectory: true, onchange: e => { uploadPickedFolder(e.target.files); e.target.value = ''; } });
   const drop = h('div', {
-    class: 'dropzone',
+    class: 'drop',
     ondragover: e => { e.preventDefault(); drop.classList.add('over'); },
     ondragleave: () => drop.classList.remove('over'),
     ondrop: e => { e.preventDefault(); drop.classList.remove('over'); handleDrop(e.dataTransfer); },
-  }, icon('upload'), h('span', { class: 'label' }, 'Drop files or folders here'),
+  }, icon('upload', 'big'), h('span', { class: 'field-label' }, 'Drop files or folders'),
   h('div', { class: 'row', style: 'justify-content:center' },
-    h('button', { type: 'button', class: 'btn sm', onclick: () => fileInput.click() }, icon('disk'), 'Add files'),
-    h('button', { type: 'button', class: 'btn sm', onclick: () => folderInput.click() }, icon('folder'), 'Add folder')),
-  h('span', { class: 'small muted' }, 'Copied into the guest before the command starts: files up to 64 MB, folders up to 512 MB. ' +
-    'Browsers don\'t send permissions, so scripts starting with #! are made executable. Your originals stay on the host.'));
+    h('button', { type: 'button', class: 'btn small', onclick: () => fileInput.click() }, 'Add Files…'),
+    h('button', { type: 'button', class: 'btn small', onclick: () => folderInput.click() }, 'Add Folder…')));
+  body.append(h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Files and folders'),
+    h('div', { class: 'stack', style: 'gap:0.6rem' }, drop, fileInput, folderInput, uploads, fileList),
+    h('p', { class: 't-foot group-foot' }, 'Copied in before the command starts: files up to 64 MB, folders up to 512 MB. Browsers don\'t send permissions, so scripts starting with #! are made executable. Your originals stay on this machine.')));
 
   async function uploadFiles(list) {
     for (const f of list) {
@@ -436,9 +765,6 @@ async function viewNew(main) {
       } catch (e) { toast(f.name + ': ' + e.message, 'err'); }
     }
   }
-
-  // A folder picked with the folder dialog: each file knows its path
-  // relative to the picked folder's parent ("proj/src/a.js").
   function uploadPickedFolder(list) {
     const byTop = new Map();
     for (const f of list) {
@@ -448,9 +774,6 @@ async function viewNew(main) {
     }
     for (const [name, items] of byTop) uploadFolder(name, items, []);
   }
-
-  // Drag and drop: folders arrive as directory entries to walk. Entries
-  // must be taken synchronously, before the drop event ends.
   function handleDrop(dt) {
     const entries = Array.from(dt.items || [], it => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
     if (!entries.length) { uploadFiles(dt.files); return; }
@@ -479,19 +802,16 @@ async function viewNew(main) {
     await walk(root, '');
     return { items, dirs };
   }
-
   function uploadFolder(name, items, dirs) {
     const total = items.reduce((a, it) => a + it.file.size, 0);
-    const bar = h('div', { style: 'width:0%' });
-    const label = h('span', { class: 'small muted' }, 'Uploading ' + items.length + ' files (' + fmtBytes(total) + ')…');
-    const row = h('div', { class: 'file-row' }, icon('folder'), h('span', { class: 'name' }, name + '/'), label,
-      h('div', { class: 'bar', style: 'flex:1' }, bar));
+    const bar = h('div');
+    const row = h('div', { class: 'file-row' }, icon('folder', 'accent'), h('span', { class: 'name' }, name + '/'),
+      h('span', { class: 't-foot' }, items.length + ' files · ' + fmtBytes(total)), h('div', { class: 'progress' }, bar));
     uploads.append(row);
     const fd = new FormData();
     for (const d of dirs) fd.append('dir', d);
     for (const it of items) { fd.append('path', it.rel); fd.append('file', it.file, 'f'); }
-    // XMLHttpRequest, not fetch, for upload progress.
-    const xhr = new XMLHttpRequest();
+    const xhr = new XMLHttpRequest(); // XMLHttpRequest, not fetch: upload progress
     xhr.open('POST', '/api/uploads/dir?name=' + encodeURIComponent(name));
     xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (100 * e.loaded / e.total).toFixed(1) + '%'; };
     xhr.onload = () => {
@@ -505,118 +825,77 @@ async function viewNew(main) {
     xhr.onerror = () => { row.remove(); toast(name + ': upload failed', 'err'); };
     xhr.send(fd);
   }
-
   function renderFiles() {
     clear(fileList);
     for (const f of form.files) {
-      fileList.append(h('div', { class: 'file-row' }, icon(f.dir ? 'folder' : 'disk'),
+      fileList.append(h('div', { class: 'file-row' }, icon(f.dir ? 'folder' : 'disk', 'accent'),
         h('span', { class: 'name', title: f.name }, f.dir ? f.name + '/' : f.name),
-        h('span', { class: 'faint small' }, (f.dir ? f.files + ' files, ' : '') + fmtBytes(f.size) + ' →'),
-        h('input', { class: 'input', value: f.path, 'aria-label': 'Guest path for ' + f.name, oninput: e => { f.path = e.target.value; } }),
-        h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove ' + f.name, onclick: () => { form.files.splice(form.files.indexOf(f), 1); renderFiles(); } }, icon('x'))));
+        h('span', { class: 't-foot' }, (f.dir ? f.files + ' files · ' : '') + fmtBytes(f.size)),
+        icon('chevronRight', 'label-3'),
+        h('input', { class: 'input mono', value: f.path, 'aria-label': 'Guest path for ' + f.name, oninput: e => { f.path = e.target.value; } }),
+        h('button', { type: 'button', class: 'btn icon plain', 'aria-label': 'Remove ' + f.name, onclick: () => { form.files.splice(form.files.indexOf(f), 1); renderFiles(); } }, icon('x'))));
     }
     renderSummary();
   }
 
-  // Env
-  const envList = h('div', { class: 'stack', style: 'gap:6px' });
+  // Resources
+  const mem = memoryPicker(form.mem, v => { form.mem = v; renderSummary(); }, s.mem_mb);
+  const tmo = timeoutPicker(form.timeout, v => { form.timeout = v; renderSummary(); }, s.timeout_s);
+  body.append(h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Resources'),
+    h('div', { class: 'group' },
+      h('div', { class: 'cell stacked' }, h('span', { class: 'field-label' }, 'Memory'), mem.el),
+      h('div', { class: 'cell stacked' }, h('span', { class: 'field-label' }, 'Timeout'), tmo.el))));
+
+  // Advanced, one level deeper
+  const envList = h('div', { class: 'stack', style: 'gap:0.5rem' });
   function renderEnv() {
     clear(envList);
     form.env.forEach((kv, i) => {
       envList.append(h('div', { class: 'row' },
-        h('input', { class: 'input', value: kv, placeholder: 'KEY=value', 'aria-label': 'Environment variable', oninput: e => { form.env[i] = e.target.value; } }),
-        h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove variable', onclick: () => { form.env.splice(i, 1); renderEnv(); } }, icon('x'))));
+        h('input', { class: 'input mono', value: kv, placeholder: 'KEY=value', 'aria-label': 'Environment variable', oninput: e => { form.env[i] = e.target.value; } }),
+        h('button', { type: 'button', class: 'btn icon plain', 'aria-label': 'Remove variable', onclick: () => { form.env.splice(i, 1); renderEnv(); } }, icon('x'))));
     });
   }
-
-  const memPicker = memoryPicker(form.mem, v => { form.mem = v; renderSummary(); }, s.mem_mb);
-  const timeoutInput = h('input', {
-    class: 'input', type: 'number', min: 1, max: 86400, value: form.timeout, 'aria-label': 'Timeout in seconds',
-    oninput: e => { form.timeout = +e.target.value; renderSummary(); },
-  });
-  const errBox = h('div');
-  const runBtn = h('button', { class: 'btn primary big', type: 'button', onclick: submit }, icon('bolt'), 'Run in sandbox', h('kbd', {}, 'Ctrl ↵'));
+  renderEnv();
+  const stdinSwitch = h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: form.interactive, 'aria-label': 'Interactive stdin', onchange: e => { form.interactive = e.target.checked; } }), h('span'));
+  body.append(h('div', { class: 'section' }, disclosure('Advanced', h('div', { class: 'stack' },
+    h('div', { class: 'stack', style: 'gap:0.4rem' }, h('span', { class: 'field-label' }, 'Working directory'),
+      h('input', { class: 'input mono', value: form.workdir, placeholder: 'From the image, or /', oninput: e => { form.workdir = e.target.value; } })),
+    h('div', { class: 'stack', style: 'gap:0.4rem' }, h('span', { class: 'field-label' }, 'Environment variables'), envList,
+      h('div', {}, h('button', { type: 'button', class: 'btn small', onclick: () => { form.env.push(''); renderEnv(); } }, icon('plus'), 'Add Variable'))),
+    h('div', { class: 'row' }, h('div', { class: 'stack', style: 'gap:0.1rem;flex:1' }, h('span', { class: 'field-label' }, 'Interactive stdin'),
+      h('span', { class: 't-foot' }, 'Type input to the command from the run page. Off: the command gets an empty stdin.')), stdinSwitch),
+    h('div', { class: 'row' }, h('div', { class: 'stack', style: 'gap:0.1rem;flex:1' }, h('span', { class: 'field-label' }, 'Network'),
+      h('span', { class: 't-foot' }, 'The guest has no network device, so nothing inside can reach your network or the internet. Optional networking is planned and will stay off by default.')),
+      h('label', { class: 'switch' }, h('input', { type: 'checkbox', disabled: true, 'aria-label': 'Network (not available)' }), h('span'))),
+  ), !!(form.workdir || form.env.length || form.interactive))));
+  body.append(errBox);
 
   function renderSummary() {
     clear(summary);
-    const lines = [
-      ['Hypervisor', 'KVM, 1 vCPU'],
-      ['Guest kernel', app.status?.kernel_version || 'default'],
-      ['Root filesystem', form.image ? imageLabel(form.image) + (app.status?.ksar_kernel ? ' (read-only EROFS + RAM overlay)' : ' (unpacked into RAM)') : 'agent only'],
-      ['Network', 'none: no network device'],
-      ['Memory', fmtMem(form.mem) + ' guest RAM'],
-      ['Timeout', form.timeout + ' s, then the VM is killed'],
-      ['Copied in', (() => {
-        const dirs = form.files.filter(f => f.dir).length;
-        const files = form.files.length - dirs;
-        return files + ' file(s), ' + dirs + ' folder(s)';
-      })()],
-      ['Afterwards', 'VM destroyed, nothing kept'],
-    ];
-    for (const [k, v] of lines) summary.append(h('div', { class: 'kv' }, h('span', {}, k), h('span', {}, v)));
+    const n = form.files.length;
+    summary.append(h('div', { style: 'color:var(--label);font-weight:590' }, imageLabel(form.image) + ' · ' + fmtMem(form.mem) + ' · ' + fmtSecs(form.timeout)),
+      h('div', {}, 'No network · ' + (n ? n + ' item' + (n === 1 ? '' : 's') + ' copied in · ' : '') + 'destroyed afterwards'));
   }
-
   async function submit() {
     clear(errBox);
     runBtn.disabled = true;
     try {
       const run = await api('POST', '/api/runs', {
-        command: form.command, image: form.image, mem_mb: form.mem, timeout_s: form.timeout,
+        command: form.command, image: form.image || '', mem_mb: form.mem, timeout_s: form.timeout,
         env: form.env.filter(e => e.trim()), workdir: form.workdir.trim(), interactive: form.interactive,
         files: form.files.map(f => ({ upload: f.upload, name: f.name, path: f.path })),
       });
-      location.hash = '#/run/' + run.id;
+      location.replace('#/run/' + run.id);
     } catch (e) {
-      errBox.append(h('div', { class: 'error-box' }, e.message));
+      errBox.append(h('div', { class: 'error-box', role: 'alert' }, e.message));
       runBtn.disabled = false;
     }
   }
-  const keyHandler = e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); submit(); } };
-  document.addEventListener('keydown', keyHandler);
-  onLeave(() => document.removeEventListener('keydown', keyHandler));
-
-  main.append(
-    h('div', { class: 'page-head' }, h('div', {},
-      h('div', { class: 'eyebrow' }, 'New sandbox run'),
-      h('h1', {}, 'Run untrusted code'),
-      h('p', { class: 'sub' }, 'Secure by default: the guest gets no network, no host files except the ones you add, and a fresh filesystem that is thrown away afterwards.'))),
-    h('div', { class: 'grid-2' },
-      h('div', { class: 'stack' },
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('terminal'), h('h2', {}, 'Command')),
-          h('label', { class: 'cmd' }, h('span', { class: 'prompt' }, '$'), cmdInput),
-          h('p', { class: 'hint' }, "Split into words like a shell, without expansion. For pipes or variables, wrap it: sh -c '…'")),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('layers'), h('h2', {}, 'Root filesystem')),
-          imageGrid),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('upload'), h('h2', {}, 'Files and folders to copy in')),
-          drop, fileInput, folderInput, uploads, fileList),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('cpu'), h('h2', {}, 'Resources')),
-          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory'), memPicker.el),
-          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Timeout (seconds)'), timeoutInput,
-            h('span', { class: 'hint' }, 'The VM is killed when it runs this long. Exit code 124.'))),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('sliders'), h('h2', {}, 'Environment')),
-          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Working directory'),
-            h('input', { class: 'input', value: form.workdir, placeholder: '/ (default)', oninput: e => { form.workdir = e.target.value; } })),
-          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Variables'), envList,
-            h('div', {}, h('button', { type: 'button', class: 'btn sm', onclick: () => { form.env.push(''); renderEnv(); } }, icon('plus'), 'Add variable'))),
-          h('label', { class: 'check' },
-            h('input', { type: 'checkbox', checked: form.interactive, onchange: e => { form.interactive = e.target.checked; } }),
-            h('span', {}, h('span', { class: 'label' }, 'Interactive stdin'), h('br'),
-              h('span', { class: 'hint' }, 'Type input to the command from the run page. Off: the command gets an empty stdin.')))),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('netOff'), h('h2', {}, 'Network'), h('span', { class: 'spacer' }), h('span', { class: 'pill ok' }, 'Off')),
-          h('p', { class: 'muted' }, 'The guest has no network device at all, so nothing inside it can reach your network or the internet. Optional networking is planned; it will stay off by default.'))),
-      h('div', { class: 'stack sticky' },
-        h('section', { class: 'card raised' },
-          h('div', { class: 'card-head' }, icon('shield'), h('h2', {}, 'Sandbox summary')),
-          summary, errBox, runBtn,
-          h('p', { class: 'small faint', style: 'text-align:center' }, 'Runs as a separate locked-down ksar process')))));
-  renderImages(); renderFiles(); renderEnv(); renderSummary();
-  cmdInput.focus();
+  body.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); submit(); } });
+  renderSummary();
+  setTimeout(() => cmdInput.focus({ preventScroll: true }), 50);
+  return [body, h('div', { class: 'sheet-foot' }, summary, h('kbd', { class: 't-foot' }, 'Ctrl ↵'), runBtn)];
 }
 
 // ---------- Terminal rendering ----------
@@ -625,9 +904,7 @@ async function viewNew(main) {
 // control sequence except SGR colors, so this only interprets colors,
 // newlines, carriage returns and backspace; everything else is text.
 class Term {
-  constructor(el) {
-    this.el = el; this.style = {}; this.lines = 0; this.newLine();
-  }
+  constructor(el) { this.el = el; this.style = {}; this.lines = 0; this.newLine(); }
   newLine() {
     this.line = document.createElement('div');
     this.el.append(this.line);
@@ -681,7 +958,7 @@ class Term {
         else if (ch === '\r') { this.text(buf, cls); buf = ''; this.pendingCR = true; continue; }
         else if (ch === '\b') { if (buf) buf = buf.slice(0, -1); }
         else {
-          if (this.pendingCR) { clear(this.line); }
+          if (this.pendingCR) clear(this.line);
           buf += ch;
         }
         this.pendingCR = false;
@@ -694,8 +971,8 @@ class Term {
 }
 
 function xterm256(n) {
-  const base = ['#6f6a66', '#ff7b72', '#45dfa4', '#f2c46d', '#79b8ff', '#d2a8ff', '#56d4dd', '#d1c5b2',
-    '#8b847f', '#ffa198', '#7ee8bd', '#ffd88a', '#a5d0ff', '#e2c5ff', '#8be9ef', '#f5efe9'];
+  const base = ['#6e6e73', '#ff6b5f', '#4cd964', '#ffd60a', '#64b5ff', '#da8fff', '#5ac8fa', '#e5e1dc',
+    '#98989d', '#ff8f85', '#7ae68c', '#ffe066', '#8fc8ff', '#e5b0ff', '#8ad8fb', '#ffffff'];
   if (n < 16) return base[n];
   if (n >= 232) { const v = 8 + (n - 232) * 10; return 'rgb(' + v + ',' + v + ',' + v + ')'; }
   n -= 16;
@@ -705,194 +982,170 @@ function xterm256(n) {
 
 // ---------- Run detail ----------
 
-function viewRun(main, id) {
+function viewRun(view, id) {
   if (!id) { location.hash = '#/runs'; return; }
   let info = null;
-  let tab = 'output';
   let wrap = false;
   const outEl = h('pre', { class: 'term', tabIndex: 0, 'aria-label': 'Command output' });
   const conEl = h('pre', { class: 'term', tabIndex: 0, hidden: true, 'aria-label': 'Guest kernel log' });
   const out = new Term(outEl);
   const con = new Term(conEl);
-  let outBytes = 0;
-  let conBytes = 0;
+  let outBytes = 0, conBytes = 0;
+  const hero = h('div', { class: 'run-hero' });
+  pageChrome(view, { title: 'Run #' + id, back: { href: '#/runs', label: 'Runs' }, header: hero });
 
-  const head = h('div', { class: 'run-head' });
-  const banner = h('div', { class: 'banner' });
-  const side = h('div', { class: 'stack sticky' });
-  const tabs = h('div', { class: 'tabs', role: 'tablist' });
-  const foot = h('div', { class: 'term-foot' });
+  const tabs = segmented([{ value: 'output', label: 'Output', count: '0 B' }, { value: 'console', label: 'Kernel Log', count: '0 B' }], 'output', v => {
+    outEl.hidden = v !== 'output'; conEl.hidden = v !== 'console';
+  }, { label: 'Output' });
+  const side = h('div', { class: 'stack sticky-col' });
   const stdinBar = h('div');
+  const foot = h('div', { class: 'term-foot' });
+  view.append(h('div', { class: 'split' },
+    h('div', { class: 'term-card' },
+      h('div', { class: 'term-bar' }, h('div', { style: 'min-width:16rem' }, tabs.el), h('span', { class: 'spacer' }),
+        h('button', { class: 'btn small', onclick: () => { wrap = !wrap; outEl.classList.toggle('wrap', wrap); conEl.classList.toggle('wrap', wrap); } }, icon('wrap'), 'Wrap'),
+        h('button', {
+          class: 'btn small', onclick: () => navigator.clipboard.writeText((outEl.hidden ? con : out).plainText())
+            .then(() => toast('Copied to clipboard'), () => toast('Copy failed', 'err')),
+        }, icon('copy'), 'Copy')),
+      outEl, conEl, stdinBar, foot),
+    side));
 
-  function renderTabs() {
-    clear(tabs);
-    for (const [k, label, n] of [['output', 'Output', outBytes], ['console', 'Guest kernel log', conBytes]]) {
-      tabs.append(h('button', {
-        class: 'tab' + (tab === k ? ' active' : ''), role: 'tab', 'aria-selected': String(tab === k),
-        onclick: () => { tab = k; outEl.hidden = k !== 'output'; conEl.hidden = k !== 'console'; renderTabs(); },
-      }, label, h('span', { class: 'count' }, fmtBytes(n))));
-    }
-  }
+  // Persistent side panels, updated in place (the meter moves on a spring).
+  const tileV = {};
+  const tile = (k, label) => h('div', { class: 'tile' }, h('span', { class: 't-foot' }, label), tileV[k] = h('span', { class: 'v' }, '—'));
+  const memText = h('span', { class: 'v mono' });
+  const meterFill = h('div', { style: 'transform:scaleX(0)' });
+  const meter = new Spring({ value: 0, precision: 0.001, onUpdate: v => { meterFill.style.transform = `scaleX(${v})`; } });
+  const cpuText = h('span', { class: 'v' });
+  const memCell = h('div', { class: 'cell stacked' }, h('div', { class: 'row' }, h('span', { class: 'k' }, 'Memory'), h('span', { class: 'spacer' }), memText),
+    h('div', { class: 'meter' }, meterFill));
+  const metrics = h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Live'),
+    h('div', { class: 'group' },
+      h('div', { class: 'tiles' }, tile('boot', 'Boot'), tile('dur', 'Duration'), tile('cid', 'vsock CID'), tile('pid', 'Host PID')),
+      memCell, h('div', { class: 'cell' }, h('span', { class: 'k' }, 'CPU'), cpuText)));
+  const resultBox = h('div');
+  const protBox = h('div', { class: 'section' });
+  side.append(resultBox, metrics, protBox);
 
-  main.append(head, banner,
-    h('div', { class: 'grid-2' },
-      h('div', { class: 'term-card' },
-        h('div', { class: 'term-bar' }, tabs,
-          h('div', { class: 'row' },
-            h('button', { class: 'btn ghost sm', onclick: () => { wrap = !wrap; outEl.classList.toggle('wrap', wrap); conEl.classList.toggle('wrap', wrap); } }, icon('wrap'), 'Wrap'),
-            h('button', {
-              class: 'btn ghost sm', onclick: () => {
-                navigator.clipboard.writeText((tab === 'output' ? out : con).plainText())
-                  .then(() => toast('Copied to clipboard'), () => toast('Copy failed', 'err'));
-              },
-            }, icon('copy'), 'Copy'))),
-        outEl, conEl, stdinBar, foot),
-      side));
-  renderTabs();
-
-  function renderHead() {
-    clear(head);
+  function renderHero() {
+    clear(hero);
     const live = isLive(info.status);
-    put(head,
-      h('a', { class: 'btn sm', href: '#/runs' }, icon('arrowLeft'), 'Runs'),
-      h('span', { class: 'run-id' }, '#' + info.id),
-      h('span', { class: 'code', style: 'max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, info.spec.command),
-      h('span', { class: 'pill neutral' }, icon('layers'), imageLabel(info.spec.image)),
-      h('span', { class: 'spacer' }),
+    put(hero,
+      h('img', { src: '/mascot.png', alt: '', class: info.status === 'booting' ? 'booting' : null }),
+      h('div', { class: 'what' },
+        h('code', { title: info.spec.command }, info.spec.command),
+        h('div', { class: 'row wrap t-sub' }, statusEl(info.status, info.exit_code),
+          h('span', {}, [imageLabel(info.spec.image), info.boot_ms ? 'booted in ' + fmtDuration(info.boot_ms) : null,
+            info.kernel, info.virtio ? 'virtio + vsock' : 'legacy serial'].filter(Boolean).join('  ·  ')))),
       h('span', { class: 'timer', id: 'run-timer' }, fmtClock(runDuration(info))),
-      statusPill(info.status, info.exit_code !== undefined && info.status !== 'succeeded' ? info.exit_code : null),
       live ? h('button', { class: 'btn danger', onclick: () => stopRun(info.id) }, icon('stop'), 'Stop') : null);
   }
-
-  function renderBanner() {
-    clear(banner);
-    const booting = info.status === 'booting';
-    banner.append(h('img', { src: '/mascot.png', alt: '', class: booting ? 'booting' : '' }));
-    if (booting) {
-      banner.append(h('span', {}, 'Booting microVM…'));
-    } else if (info.boot_ms) {
-      banner.append(h('span', { class: 'row' }, icon('bolt'), 'Booted in ', h('b', { style: 'color:var(--ok)' }, fmtDuration(info.boot_ms))));
-    } else {
-      banner.append(h('span', { class: 'muted' }, 'The VM did not finish booting.'));
-    }
-    if (info.kernel) banner.append(h('span', { class: 'sep' }, '·'), h('span', {}, 'kernel ' + info.kernel));
-    banner.append(h('span', { class: 'sep' }, '·'), h('span', {}, info.virtio ? 'virtio + vsock' : 'legacy (serial)'));
-    if (info.cid) banner.append(h('span', { class: 'sep' }, '·'), h('span', {}, 'CID ' + info.cid));
-  }
-
-  function renderSide() {
-    clear(side);
+  function renderMetrics() {
     const live = isLive(info.status);
-    const memPct = info.mem_limit ? Math.min(100, 100 * (info.mem_current || 0) / info.mem_limit) : 0;
-    side.append(h('section', { class: 'card raised' },
-      h('div', { class: 'card-head' }, icon('cpu'), h('h2', {}, 'Live metrics'),
-        h('span', { class: 'spacer' }), live ? h('span', { class: 'pill running' }, h('span', { class: 'dot' }), 'live') : null),
-      h('div', { class: 'tiles' },
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'Boot'), h('span', { class: 'v' }, info.boot_ms ? fmtDuration(info.boot_ms) : '--')),
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'Duration'), h('span', { class: 'v' }, fmtDuration(runDuration(info)))),
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'vsock CID'), h('span', { class: 'v' }, info.cid ? String(info.cid) : '--')),
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'Host PID'), h('span', { class: 'v' }, info.pid ? String(info.pid) : '--'))),
-      info.scope ? h('div', { class: 'field' },
-        h('div', { class: 'kv' }, h('span', {}, 'Memory (cgroup)'), h('span', {}, fmtBytes(info.mem_current) + ' / ' + fmtBytes(info.mem_limit))),
-        h('div', { class: 'bar big' }, h('div', { style: 'width:' + memPct.toFixed(1) + '%' })),
-        h('div', { class: 'kv small' }, h('span', {}, 'Peak'), h('span', {}, fmtBytes(info.mem_peak))),
-        h('div', { class: 'kv' }, h('span', {}, 'CPU'), h('span', {}, live ? info.cpu_percent.toFixed(0) + '% of one core' : '--')))
-        : h('p', { class: 'small muted' }, 'Memory and CPU are measured through the run\'s cgroup, which is unavailable without a systemd user session.')));
-
-    const prot = [];
-    const add = (ok, t, d) => prot.push(h('div', { class: 'prot ' + (ok ? 'ok' : 'warn') }, icon(ok ? 'shield' : 'shieldOff'),
-      h('div', {}, h('div', { class: 't' }, t), h('div', { class: 'd' }, d))));
-    add(true, 'Hardware isolation', 'Own guest kernel under KVM');
-    add(info.lockdown, 'Seccomp lockdown', info.lockdown ? 'The VMM process may not open files, create sockets, exec or fork' : 'Disabled for this run');
-    add(!!info.scope, 'Cgroup limits', info.scope ? 'Memory capped at ' + fmtBytes(info.mem_limit) + ', no swap, 256 tasks, 1.5 CPUs' : 'No systemd user session: limits not applied');
-    add(true, 'No network', 'The guest has no network device');
-    if (info.spec.image) {
-      add(info.virtio, info.virtio ? 'Read-only image + RAM overlay' : 'Image unpacked into RAM',
-        info.virtio ? 'Writes go to a tmpfs layer, destroyed with the VM' : 'Legacy mode: writes stay in guest RAM, destroyed with the VM');
-    } else {
-      add(true, 'No image', 'Only the agent is in the guest');
-    }
-    add(true, 'Output filtered', info.filtered ? info.filtered + ' terminal control sequence(s) removed' : 'Control sequences are removed; colors are kept');
-    side.append(h('section', { class: 'card raised' },
-      h('div', { class: 'card-head' }, icon('shield'), h('h2', {}, 'Active protections')), prot));
-
-    if (!live) {
-      const code = info.exit_code;
-      const cls = info.status === 'succeeded' ? 'ok' : info.status === 'timed_out' || info.status === 'stopped' ? 'warn' : 'bad';
-      const msg = {
-        succeeded: 'The command finished successfully.',
-        failed: code > 128 ? 'The command was killed by signal ' + (code - 128) + '.' : 'The command exited with an error.',
-        timed_out: 'The VM hit its ' + info.spec.timeout_s + ' s timeout and was killed.',
-        stopped: 'You stopped this run.',
-        error: 'Ksar could not complete the run.',
-      }[info.status];
-      side.append(h('section', { class: 'card raised' },
-        h('div', { class: 'exit-big' },
-          info.status === 'succeeded' ? h('img', { src: '/mascot.png', alt: '', width: 40, height: 40 }) : null,
-          h('div', {}, h('div', { class: 'eyebrow' }, 'Exit code'), h('div', { class: 'exit-code ' + cls }, code === undefined ? '--' : String(code)))),
-        h('p', { class: 'muted' }, msg),
-        info.error ? h('div', { class: 'error-box' }, info.error) : null,
-        info.truncated ? h('p', { class: 'small muted' }, 'Output beyond 4 MB was not kept.') : null,
-        h('button', {
-          class: 'btn primary', onclick: () => {
-            app.prefill = Object.assign({}, info.spec, { files: [] });
-            location.hash = '#/new';
-            if (info.spec.files && info.spec.files.length) toast('Files are not kept after a run; add them again.');
-          },
-        }, icon('replay'), 'Run again with the same settings')));
-    }
+    tileV.boot.textContent = info.boot_ms ? fmtDuration(info.boot_ms) : '—';
+    tileV.dur.textContent = fmtDuration(runDuration(info));
+    tileV.cid.textContent = info.cid ? String(info.cid) : '—';
+    tileV.pid.textContent = info.pid ? String(info.pid) : '—';
+    if (info.scope) {
+      memCell.hidden = false;
+      memText.textContent = fmtBytes(info.mem_current || info.mem_peak) + ' of ' + fmtBytes(info.mem_limit);
+      meter.to(info.mem_limit ? clamp((info.mem_current || 0) / info.mem_limit, 0, 1) : 0, { damping: 1, response: 0.5 });
+    } else memCell.hidden = true;
+    cpuText.textContent = live && info.scope ? info.cpu_percent.toFixed(0) + '% of one core' : '—';
   }
-
+  function renderProtections() {
+    clear(protBox);
+    const cell = (ok, t, d) => h('div', { class: 'cell ' + (ok ? 'ok' : 'warn') }, icon(ok ? 'shield' : 'shieldOff', 'state'),
+      h('div', { class: 'text' }, h('span', { class: 'k' }, t), h('span', { class: 't-foot' }, d)));
+    put(protBox, h('div', { class: 't-caps group-title' }, 'Protections'), h('div', { class: 'group' },
+      cell(true, 'Hardware isolation', 'Its own guest kernel under KVM'),
+      cell(info.lockdown, 'Seccomp lockdown', info.lockdown ? 'The VMM can\'t open files, create sockets, exec or fork' : 'Disabled for this run'),
+      cell(!!info.scope, 'Cgroup limits', info.scope ? 'Memory ≤ ' + fmtBytes(info.mem_limit) + ', no swap, 256 tasks, 1.5 CPUs' : 'No systemd user session: not applied'),
+      cell(true, 'No network', 'No network device in the guest'),
+      info.spec.image
+        ? cell(info.virtio, info.virtio ? 'Read-only image' : 'Image in RAM', info.virtio ? 'Writes go to a RAM layer, gone with the VM' : 'Legacy mode: writes stay in guest RAM')
+        : cell(true, 'No image', 'Only the agent is in the guest'),
+      cell(true, 'Output filtered', info.filtered ? info.filtered + ' control sequence' + (info.filtered === 1 ? '' : 's') + ' removed' : 'Colors kept, control sequences removed')));
+  }
+  function renderResult() {
+    clear(resultBox);
+    if (isLive(info.status)) return;
+    const code = info.exit_code;
+    const cls = info.status === 'succeeded' ? 'ok' : info.status === 'timed_out' || info.status === 'stopped' ? 'warn' : 'bad';
+    const msg = {
+      succeeded: 'Finished successfully.',
+      failed: code > 128 ? 'Killed by signal ' + (code - 128) + '.' : 'Exited with an error.',
+      timed_out: 'Killed after its ' + fmtSecs(info.spec.timeout_s) + ' timeout.',
+      stopped: 'You stopped this run.',
+      error: 'Ksar couldn\'t complete the run.',
+    }[info.status];
+    const card = h('div', { class: 'group' }, h('div', { class: 'cell stacked' },
+      h('div', { class: 'result' },
+        info.status === 'succeeded' ? h('img', { src: '/mascot.png', alt: '' }) : null,
+        h('div', {}, h('div', { class: 't-foot' }, 'Exit code'), h('div', { class: 'code ' + cls }, code === undefined ? '—' : String(code))),
+        h('span', { class: 'spacer' }), h('span', { class: 't-sub', style: 'text-align:right' }, msg)),
+      info.error ? h('div', { class: 'error-box' }, info.error) : null,
+      info.truncated ? h('p', { class: 't-foot', style: 'margin:0' }, 'Output beyond 4 MB was not kept.') : null,
+      h('button', {
+        class: 'btn primary', onclick: () => {
+          app.prefill = Object.assign({}, info.spec, { files: [] });
+          location.hash = '#/new';
+          if (info.spec.files && info.spec.files.length) toast('Files aren\'t kept after a run; add them again.');
+        },
+      }, icon('replay'), 'Run Again')));
+    resultBox.append(card);
+    const m = motion(card); // the result materializes, it doesn't pop
+    m.set({ scale: 0.96, opacity: 0 });
+    m.to({ scale: 1, opacity: 1 }, { damping: 1, response: 0.35 });
+  }
   function renderStdin() {
     clear(stdinBar);
     if (!info.interactive || !isLive(info.status)) return;
-    const input = h('input', { class: 'input', placeholder: 'Type a line for stdin and press Enter', 'aria-label': 'Standard input' });
-    const send = async (close) => {
+    const input = h('input', { class: 'input mono', placeholder: 'Type a line for stdin and press Return', 'aria-label': 'Standard input' });
+    const send = async closeIt => {
       try {
-        await api('POST', '/api/runs/' + id + '/stdin', { data: close ? '' : input.value + '\n', close });
-        if (!close) { out.write(input.value + '\n', 'meta'); input.value = ''; }
-        else { toast('stdin closed'); renderStdin(); info.interactive = false; }
+        await api('POST', '/api/runs/' + id + '/stdin', { data: closeIt ? '' : input.value + '\n', close: closeIt });
+        if (!closeIt) { out.write(input.value + '\n', 'meta'); input.value = ''; } else { info.interactive = false; renderStdin(); toast('stdin closed'); }
       } catch (e) { toast(e.message, 'err'); }
     };
     input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(false); } });
-    stdinBar.append(h('div', { class: 'stdin' }, h('span', { class: 'prompt mono', style: 'color:var(--primary)' }, '›'), input,
-      h('button', { class: 'btn sm', onclick: () => send(false) }, 'Send'),
-      h('button', { class: 'btn sm', onclick: () => send(true) }, 'Close stdin (EOF)')));
+    stdinBar.append(h('div', { class: 'stdin' }, h('span', { class: 'prompt' }, '›'), input,
+      h('button', { class: 'btn small', onclick: () => send(false) }, 'Send'),
+      h('button', { class: 'btn small', onclick: () => send(true) }, 'Send EOF')));
   }
-
   function renderFoot() {
     clear(foot);
-    foot.append(h('span', {}, 'agent channel: ' + (info.virtio ? 'vsock' : 'serial')),
-      h('span', { title: JSON.stringify(info.args) }, 'argv[0] ' + info.args[0] + ' · ' + info.args.length + ' arg(s)'));
+    put(foot, h('span', {}, 'Agent channel: ' + (info.virtio ? 'vsock' : 'serial')),
+      h('span', { title: JSON.stringify(info.args) }, info.args[0] + ' · ' + info.args.length + ' argument' + (info.args.length === 1 ? '' : 's')));
   }
 
-  let lastStatus = null;
+  let last = { status: null, filtered: -1 };
   function update(next) {
     info = next;
-    renderHead();
-    renderSide();
-    if (info.status !== lastStatus) { renderBanner(); renderStdin(); renderFoot(); lastStatus = info.status; }
+    renderHero();
+    renderMetrics();
+    if (info.status !== last.status || info.filtered !== last.filtered || !protBox.firstChild) renderProtections();
+    if (info.status !== last.status) { renderResult(); renderStdin(); renderFoot(); }
+    last = { status: info.status, filtered: info.filtered };
   }
 
-  // Live stream. EventSource reconnects by itself and resumes from the
-  // last chunk it saw (Last-Event-ID).
+  // Live stream; EventSource resumes from the last chunk (Last-Event-ID).
   const es = new EventSource('/api/runs/' + encodeURIComponent(id) + '/events');
   onLeave(() => es.close());
   es.addEventListener('state', e => update(JSON.parse(e.data)));
   es.addEventListener('chunk', e => {
     const c = JSON.parse(e.data);
-    if (c.stream === 'console') { con.write(c.data); conBytes += c.data.length; }
-    else { out.write(c.data, c.stream === 'stderr' ? 'stderr' : ''); outBytes += c.data.length; }
-    renderTabs();
+    if (c.stream === 'console') { con.write(c.data); conBytes += c.data.length; tabs.setCount(1, fmtBytes(conBytes)); }
+    else { out.write(c.data, c.stream === 'stderr' ? 'stderr' : ''); outBytes += c.data.length; tabs.setCount(0, fmtBytes(outBytes)); }
   });
   es.addEventListener('end', () => es.close());
   es.onerror = () => {
-    if (!info) {
-      es.close();
-      clear(main);
-      main.append(h('div', { class: 'empty' }, h('img', { src: '/mascot.png', alt: '' }), h('h2', {}, 'Run not found'),
-        h('p', {}, 'Runs are kept only while ksar ui is running.'), h('a', { class: 'btn', href: '#/runs' }, icon('arrowLeft'), 'Back to runs')));
-    }
+    if (info) return;
+    es.close();
+    clear(view);
+    view.append(h('div', { class: 'empty' }, h('img', { src: '/mascot.png', alt: '' }), h('h2', { class: 't-title' }, 'Run Not Found'),
+      h('p', {}, 'Runs are kept only while ksar ui is running.'), h('a', { class: 'btn', href: '#/runs' }, icon('chevronLeft'), 'Runs')));
   };
   every(100, () => {
     if (!info || !isLive(info.status)) return;
@@ -903,12 +1156,18 @@ function viewRun(main, id) {
 
 // ---------- Images ----------
 
-function viewImages(main) {
-  const usage = h('section', { class: 'card' });
-  const list = h('div', { class: 'stack', style: 'gap:8px' });
-  const refInput = h('input', { class: 'input', placeholder: 'alpine:3.20, python:3.12-slim, node:22-alpine…', 'aria-label': 'Docker image', style: 'max-width:360px' });
-  const importBtn = h('button', { class: 'btn primary', onclick: doImport }, icon('download'), 'Import from Docker');
+function viewImages(view) {
+  const refInput = h('input', { class: 'input mono', placeholder: 'alpine:3.20, python:3.12-slim…', 'aria-label': 'Docker image', style: 'flex:1' });
+  const importBtn = h('button', { class: 'btn primary', onclick: doImport }, icon('download'), 'Import');
   refInput.addEventListener('keydown', e => { if (e.key === 'Enter') doImport(); });
+  pageChrome(view, { title: 'Images', subtitle: 'Each image is a filesystem tar, for example a Docker export. On first use Ksar converts it to a read-only EROFS disk and caches it, so later runs start instantly.' });
+  const storage = h('div', { class: 'section' });
+  const list = h('div', { class: 'section' });
+  const importNote = h('p', { class: 't-foot group-foot' });
+  view.append(h('div', { class: 'stack', style: 'gap:1.75rem' },
+    h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Import from Docker'),
+      h('div', { class: 'group' }, h('div', { class: 'cell' }, refInput, importBtn)), importNote),
+    list, storage));
 
   async function doImport() {
     const ref = refInput.value.trim();
@@ -920,15 +1179,8 @@ function viewImages(main) {
       refInput.value = '';
       load();
     } catch (e) { toast(e.message, 'err'); }
-    importBtn.disabled = false;
+    importBtn.disabled = !app.status?.docker;
   }
-
-  main.append(
-    h('div', { class: 'page-head' },
-      h('div', {}, h('div', { class: 'eyebrow' }, 'Root filesystems'), h('h1', {}, 'Images'),
-        h('p', { class: 'sub' }, 'Each image is a filesystem tar, for example a Docker export. On first use Ksar converts it to a read-only EROFS disk and caches it, so later runs start instantly.')),
-      h('div', { class: 'row wrap' }, refInput, importBtn)),
-    usage, h('div', { style: 'height:16px' }), list);
 
   let pollImporting = false;
   async function load() {
@@ -936,58 +1188,50 @@ function viewImages(main) {
     try { [images, st] = await Promise.all([api('GET', '/api/images'), api('GET', '/api/status')]); } catch (e) { toast(e.message, 'err'); return; }
     app.status = st;
     importBtn.disabled = !st.docker;
-    importBtn.title = st.docker ? '' : 'Docker is not installed';
-    clear(usage);
-    const libBytes = images.reduce((a, i) => a + (i.size || 0), 0);
-    put(usage,
-      h('div', { class: 'card-head' }, icon('disk'), h('h2', {}, 'Storage'), h('span', { class: 'spacer' }),
-        h('button', {
-          class: 'btn sm', onclick: async () => {
-            try { const r = await api('POST', '/api/images/prune'); toast('Freed ' + fmtBytes(r.freed)); load(); } catch (e) { toast(e.message, 'err'); }
-          },
-        }, icon('trash'), 'Prune unused disks')),
-      h('div', { class: 'tiles' },
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'Library (tars)'), h('span', { class: 'v' }, fmtBytes(libBytes) + ' · ' + images.length + ' image(s)')),
-        h('div', { class: 'tile' }, h('span', { class: 'eyebrow' }, 'Disk cache (EROFS)'), h('span', { class: 'v' }, fmtBytes(st.cache_bytes) + ' · ' + st.cache_images + ' disk(s)'))),
-      h('div', { class: 'kv small' }, h('span', {}, 'Library'), h('span', {}, st.images_dir)),
-      st.docker ? null : h('div', { class: 'note' }, icon('info'), h('span', {}, 'Docker is not installed. You can still add images: put any root filesystem .tar into the library directory.')));
+    importNote.textContent = st.docker
+      ? 'Pulls the image, exports its filesystem and keeps its environment (PATH, working directory).'
+      : 'Docker isn\'t installed. You can still add images: put a root filesystem .tar into ' + st.images_dir + '.';
 
     clear(list);
+    list.append(h('div', { class: 't-caps group-title' }, 'Library'));
     if (!images.length) {
-      list.append(h('div', { class: 'empty' }, h('img', { src: '/mascot.png', alt: '' }), h('h2', {}, 'No images yet'),
-        h('p', {}, 'Import one from Docker above, or copy a root filesystem tar into ' + st.images_dir + '. Without an image, runs contain only the agent.')));
-    }
-    pollImporting = false;
-    for (const img of images) {
-      if (img.importing) pollImporting = true;
-      const facts = [];
-      if (img.importing) facts.push('importing…');
-      else if (img.error) facts.push('import failed');
-      else {
-        facts.push(fmtBytes(img.size) + ' tar');
-        facts.push(img.cached ? 'EROFS disk ready (' + fmtBytes(img.cache_size) + ')' : 'not converted yet');
-        if (img.last_used) facts.push('last used ' + fmtAgo(img.last_used));
-      }
-      list.append(h('div', { class: 'img-row' },
-        h('div', { class: 'img-ico' }, icon('layers')),
-        h('div', { class: 'img-meta' },
-          h('div', { class: 'row wrap' }, h('span', { class: 'name' }, imageLabel(img.name)),
-            img.cached ? h('span', { class: 'pill ok' }, 'cached') : null,
-            img.importing ? h('span', { class: 'pill running' }, h('span', { class: 'dot' }), 'importing') : null,
-            img.error ? h('span', { class: 'pill error' }, 'failed') : null),
-          h('div', { class: 'facts' }, facts.map(f => h('span', {}, f))),
-          img.error ? h('div', { class: 'error-box' }, img.error) : null),
-        h('div', { class: 'row' },
-          !img.importing && !img.error ? h('button', {
-            class: 'btn primary sm', onclick: () => { app.prefill = { image: img.name }; location.hash = '#/new'; },
-          }, icon('play'), 'Run') : null,
+      list.append(h('div', { class: 'group' }, h('div', { class: 'empty' }, h('img', { src: '/mascot.png', alt: '' }), h('h2', { class: 't-title' }, 'No Images Yet'),
+        h('p', {}, 'Import one from Docker above, or copy a root filesystem tar into ' + st.images_dir + '.'))));
+    } else {
+      const group = h('div', { class: 'group' });
+      pollImporting = false;
+      for (const img of images) {
+        if (img.importing) pollImporting = true;
+        const facts = img.importing ? 'Importing…' : img.error ? 'Import failed' :
+          [fmtBytes(img.size), img.cached ? 'disk ready' : 'not converted yet', img.last_used ? 'used ' + fmtAgo(img.last_used).toLowerCase() : null].filter(Boolean).join(' · ');
+        group.append(h('div', { class: 'cell' },
+          h('div', { class: 'img-icon' }, icon('layers')),
+          h('div', { class: 'text', style: 'flex:1' }, h('span', { class: 'k', style: 'font-weight:590' }, imageLabel(img.name)), h('span', { class: 't-foot' }, facts),
+            img.error ? h('div', { class: 'error-box', style: 'margin-top:0.4rem' }, img.error) : null),
+          img.importing ? h('span', { class: 'status running' }, h('span', { class: 'dot' }), 'Importing') : null,
+          !img.importing && !img.error ? h('button', { class: 'btn small', onclick: () => { app.prefill = { image: img.name }; location.hash = '#/new'; } }, icon('play'), 'Run') : null,
           img.importing ? null : h('button', {
-            class: 'btn danger sm', 'aria-label': 'Delete ' + img.name, onclick: async () => {
+            class: 'btn small danger', 'aria-label': 'Delete ' + img.name, onclick: async () => {
               if (!img.error && !confirm('Delete ' + img.name + ' and its cached disk?')) return;
               try { await api('DELETE', '/api/images/' + encodeURIComponent(img.name)); load(); } catch (e) { toast(e.message, 'err'); }
             },
-          }, icon('trash'), img.error ? 'Dismiss' : 'Delete'))));
+          }, img.error ? 'Dismiss' : 'Delete')));
+      }
+      list.append(group);
     }
+
+    clear(storage);
+    const libBytes = images.reduce((a, i) => a + (i.size || 0), 0);
+    put(storage, h('div', { class: 't-caps group-title' }, 'Storage'), h('div', { class: 'group' },
+      h('div', { class: 'cell' }, h('span', { class: 'k' }, 'Library'), h('span', { class: 'v' }, fmtBytes(libBytes) + ' in ' + images.length + ' image' + (images.length === 1 ? '' : 's'))),
+      h('div', { class: 'cell' }, h('span', { class: 'k' }, 'Disk cache'), h('span', { class: 'v' }, fmtBytes(st.cache_bytes) + ' in ' + st.cache_images + ' disk' + (st.cache_images === 1 ? '' : 's'))),
+      h('div', { class: 'cell' }, h('span', { class: 'k' }, 'Location'), h('span', { class: 'v mono' }, st.images_dir)),
+      h('div', { class: 'cell' }, h('button', {
+        class: 'btn small', onclick: async () => {
+          try { const r = await api('POST', '/api/images/prune'); toast('Freed ' + fmtBytes(r.freed)); load(); } catch (e) { toast(e.message, 'err'); }
+        },
+      }, icon('trash'), 'Remove Unused Disks'))),
+    h('p', { class: 't-foot group-foot' }, 'Disks are rebuilt automatically the next time an image is used.'));
   }
   load();
   every(2000, () => { if (pollImporting) load(); });
@@ -995,78 +1239,73 @@ function viewImages(main) {
 
 // ---------- Settings ----------
 
-async function viewSettings(main) {
+async function viewSettings(view) {
+  pageChrome(view, { title: 'Settings', subtitle: 'Defaults for new runs, and what Ksar found on this machine.' });
   let st, s;
   try { [st, s] = await Promise.all([api('GET', '/api/status'), api('GET', '/api/settings')]); } catch (e) { toast(e.message, 'err'); return; }
-  let memMB = s.mem_mb;
+  let memMB = s.mem_mb, timeoutS = s.timeout_s;
   const mem = memoryPicker(s.mem_mb, v => { memMB = v; }, 256);
-  const timeout = h('input', { class: 'input', type: 'number', min: 1, max: 86400, value: s.timeout_s });
-  const check = (ok, label, detail) => h('div', { class: 'prot ' + (ok ? 'ok' : 'warn') }, icon(ok ? 'check' : 'alert'),
-    h('div', {}, h('div', { class: 't' }, label), h('div', { class: 'd' }, detail)));
+  const tmo = timeoutPicker(s.timeout_s, v => { timeoutS = v; }, 60);
+  const check = (ok, label, detail) => h('div', { class: 'cell ' + (ok ? 'ok' : 'warn') }, icon(ok ? 'checkCircle' : 'alert', 'state'),
+    h('div', { class: 'text' }, h('span', { class: 'k' }, label), h('span', { class: 't-foot' }, detail)));
+  const kv = (k, v, mono) => mono
+    ? h('div', { class: 'cell stacked', style: 'gap:0.15rem' }, h('span', { class: 'k' }, k), h('span', { class: 'mono t-foot', style: 'overflow-wrap:anywhere' }, v))
+    : h('div', { class: 'cell' }, h('span', { class: 'k' }, k), h('span', { class: 'v' }, v));
 
-  main.append(
-    h('div', { class: 'page-head' }, h('div', {}, h('div', { class: 'eyebrow' }, 'This machine'), h('h1', {}, 'Settings & security'),
-      h('p', { class: 'sub' }, 'Defaults for new runs, and what Ksar found on this machine.'))),
-    h('div', { class: 'grid-2' },
-      h('div', { class: 'stack' },
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('sliders'), h('h2', {}, 'Defaults for new runs')),
-          h('div', { class: 'field' }, h('span', { class: 'label' }, 'Guest memory'), mem.el),
-          h('label', { class: 'field', style: 'max-width:260px' }, h('span', { class: 'label' }, 'Timeout (seconds)'), timeout),
-          h('div', { class: 'row' },
+  view.append(h('div', { class: 'split' },
+    h('div', { class: 'stack', style: 'gap:1.75rem' },
+      h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Defaults for New Runs'),
+        h('div', { class: 'group' },
+          h('div', { class: 'cell stacked' }, h('span', { class: 'field-label' }, 'Memory'), mem.el),
+          h('div', { class: 'cell stacked' }, h('span', { class: 'field-label' }, 'Timeout'), tmo.el),
+          h('div', { class: 'cell' },
             h('button', {
               class: 'btn primary', onclick: async () => {
-                try {
-                  app.settings = await api('PUT', '/api/settings', { mem_mb: memMB, timeout_s: +timeout.value });
-                  toast('Defaults saved');
-                } catch (e) { toast(e.message, 'err'); }
+                try { app.settings = await api('PUT', '/api/settings', { mem_mb: memMB, timeout_s: timeoutS }); toast('Defaults saved'); } catch (e) { toast(e.message, 'err'); }
               },
-            }, icon('check'), 'Save'),
-            h('button', { class: 'btn', onclick: () => { mem.set(256); timeout.value = 60; } }, 'Reset to secure defaults'))),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('lock'), h('h2', {}, 'How this page is protected')),
-          h('div', { class: 'kv' }, h('span', {}, 'Listening on'), h('span', {}, st.addr)),
-          h('ul', { class: 'muted', style: 'margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px' },
-            h('li', {}, 'Only reachable from this machine (loopback address).'),
-            h('li', {}, 'Requires the one-time link printed by ksar ui; it sets a session cookie this page can\'t read.'),
-            h('li', {}, 'Refuses requests from other websites and from pages on other local ports.'),
-            h('li', {}, 'Never shows guest output as HTML, and loads nothing from the internet.'),
-            h('li', {}, 'Each run is its own ksar process, locked down with seccomp and confined to a cgroup.')),
-          h('p', { class: 'small faint' }, 'To sign in again or from another browser, restart ksar ui and open the new link.'))),
-      h('div', { class: 'stack' },
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('cpu'), h('h2', {}, 'System checks')),
+            }, 'Save'),
+            h('button', { class: 'btn', onclick: () => { mem.set(256); tmo.set(60); } }, 'Use Secure Defaults')))),
+      h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'How This Page Is Protected'),
+        h('div', { class: 'group' },
+          kv('Listening on', st.addr, true),
+          h('div', { class: 'cell' }, h('span', { class: 't-sub' }, 'Only reachable from this machine, and only through the one-time link ksar ui printed, which sets a session cookie this page can\'t read.')),
+          h('div', { class: 'cell' }, h('span', { class: 't-sub' }, 'Requests from other websites, or from pages on other local ports, are refused.')),
+          h('div', { class: 'cell' }, h('span', { class: 't-sub' }, 'Guest output is never shown as HTML, and nothing is loaded from the internet.')),
+          h('div', { class: 'cell' }, h('span', { class: 't-sub' }, 'Each run is its own ksar process, locked down with seccomp and confined to a cgroup.'))),
+        h('p', { class: 't-foot group-foot' }, 'To sign in again or from another browser, restart ksar ui and open the new link.'))),
+    h('div', { class: 'stack', style: 'gap:1.75rem' },
+      h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'System'),
+        h('div', { class: 'group' },
           check(st.kvm, '/dev/kvm', st.kvm ? 'Readable and writable' : 'Not accessible: add your user to the kvm group'),
-          check(st.vhost_vsock, '/dev/vhost-vsock', st.vhost_vsock ? 'Available for the agent channel' : 'Missing: load the vhost_vsock module (sudo modprobe vhost_vsock)'),
-          check(st.ksar_kernel, 'Guest kernel', st.kernel_version ? st.kernel_version + (st.ksar_kernel ? '' : ' (not the Ksar kernel: legacy mode, run make kernel)') : 'Not found'),
+          check(st.vhost_vsock, '/dev/vhost-vsock', st.vhost_vsock ? 'Available for the agent channel' : 'Missing: sudo modprobe vhost_vsock'),
+          check(st.ksar_kernel, 'Guest kernel', st.kernel_version ? st.kernel_version + (st.ksar_kernel ? '' : ': not the Ksar kernel, legacy mode (make kernel)') : 'Not found'),
           check(st.mkfs_erofs, 'mkfs.erofs', st.mkfs_erofs ? 'Images can be converted to disks' : 'Install erofs-utils to convert images'),
-          check(st.cgroups, 'Cgroup limits', st.cgroups ? 'systemd user session found' : 'No systemd user session: runs have no cgroup limits'),
-          check(st.docker, 'Docker', st.docker ? 'Images can be imported' : 'Optional: needed only to import images')),
-        h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, icon('disk'), h('h2', {}, 'Storage')),
-          h('div', { class: 'kv' }, h('span', {}, 'Kernel'), h('span', {}, st.kernel || '--')),
-          h('div', { class: 'kv' }, h('span', {}, 'Image library'), h('span', {}, st.images_dir)),
-          h('div', { class: 'kv' }, h('span', {}, 'Disk cache'), h('span', {}, st.cache_dir)),
-          h('div', { class: 'kv' }, h('span', {}, 'Cache size'), h('span', {}, fmtBytes(st.cache_bytes) + ' in ' + st.cache_images + ' disk(s)')),
-          h('button', {
-            class: 'btn danger', onclick: async () => {
+          check(st.cgroups, 'Cgroup limits', st.cgroups ? 'systemd user session found' : 'No systemd user session: no limits'),
+          check(st.docker, 'Docker', st.docker ? 'Images can be imported' : 'Optional: only needed to import images'))),
+      h('div', { class: 'section' }, h('div', { class: 't-caps group-title' }, 'Storage'),
+        h('div', { class: 'group' },
+          kv('Kernel', st.kernel || '—', true), kv('Image library', st.images_dir, true), kv('Disk cache', st.cache_dir, true),
+          kv('Cache size', fmtBytes(st.cache_bytes) + ' in ' + st.cache_images + ' disk' + (st.cache_images === 1 ? '' : 's')),
+          h('div', { class: 'cell' }, h('button', {
+            class: 'btn small danger', onclick: async () => {
               if (!confirm('Delete all cached image disks? They are rebuilt on next use.')) return;
               try { const r = await api('POST', '/api/cache/clear'); toast('Freed ' + fmtBytes(r.freed)); } catch (e) { toast(e.message, 'err'); }
             },
-          }, icon('trash'), 'Clear disk cache')))));
+          }, icon('trash'), 'Clear Disk Cache')))))));
 }
 
 // ---------- Boot ----------
 
 function init() {
   for (const el of document.querySelectorAll('[data-icon]')) el.replaceWith(icon(el.dataset.icon));
+  api('GET', '/api/settings').then(s => { app.settings = s; }, () => { });
   window.addEventListener('hashchange', route);
   document.addEventListener('keydown', e => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n' && !e.shiftKey) {
       e.preventDefault();
-      location.hash = '#/new';
-    } else if (e.key === 'Escape' && !typing && location.hash.startsWith('#/run/')) {
+      if (location.hash !== '#/new') location.hash = '#/new';
+    } else if (e.key === 'Escape' && !typing && !app.sheet && location.hash.startsWith('#/run/')) {
       location.hash = '#/runs';
     }
   });
