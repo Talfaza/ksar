@@ -23,8 +23,6 @@ make && make kernel
 ./ksar            # opens Ksar in your browser
 ```
 
-> *Ksar* (قصر) is a fortified village of southern Morocco: what's inside the
-> walls stays inside.
 
 > [!WARNING]
 > Ksar is **alpha** software and has not had a security audit. It is built as
