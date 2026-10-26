@@ -1,0 +1,76 @@
+#include "textflag.h"
+
+// func dotQ8AVX2(q *int8, scales *float32, x *float32, blocks int) float32
+//
+// Sum over blocks of 32: scale[b] * sum(q[i] * x[i]). Each block widens
+// 32 int8 to float32 in four groups of 8 and accumulates with FMA.
+TEXT ·dotQ8AVX2(SB), NOSPLIT, $0-36
+	MOVQ q+0(FP), SI
+	MOVQ scales+8(FP), DX
+	MOVQ x+16(FP), DI
+	MOVQ blocks+24(FP), CX
+	VXORPS Y0, Y0, Y0
+
+block:
+	VPMOVSXBD 0(SI), Y1
+	VPMOVSXBD 8(SI), Y2
+	VPMOVSXBD 16(SI), Y3
+	VPMOVSXBD 24(SI), Y4
+	VCVTDQ2PS Y1, Y1
+	VCVTDQ2PS Y2, Y2
+	VCVTDQ2PS Y3, Y3
+	VCVTDQ2PS Y4, Y4
+	VMULPS 0(DI), Y1, Y5
+	VFMADD231PS 32(DI), Y2, Y5
+	VFMADD231PS 64(DI), Y3, Y5
+	VFMADD231PS 96(DI), Y4, Y5
+	VBROADCASTSS (DX), Y6
+	VFMADD231PS Y5, Y6, Y0
+	ADDQ $32, SI
+	ADDQ $4, DX
+	ADDQ $128, DI
+	DECQ CX
+	JNZ block
+
+	VEXTRACTF128 $1, Y0, X1
+	VADDPS X1, X0, X0
+	VHADDPS X0, X0, X0
+	VHADDPS X0, X0, X0
+	VZEROUPPER
+	MOVSS X0, ret+32(FP)
+	RET
+
+// func dotF32AVX2(a, b *float32, n int) float32   (n a multiple of 32)
+TEXT ·dotF32AVX2(SB), NOSPLIT, $0-28
+	MOVQ a+0(FP), SI
+	MOVQ b+8(FP), DI
+	MOVQ n+16(FP), CX
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	VXORPS Y2, Y2, Y2
+	VXORPS Y3, Y3, Y3
+
+loop32:
+	VMOVUPS 0(SI), Y4
+	VMOVUPS 32(SI), Y5
+	VMOVUPS 64(SI), Y6
+	VMOVUPS 96(SI), Y7
+	VFMADD231PS 0(DI), Y4, Y0
+	VFMADD231PS 32(DI), Y5, Y1
+	VFMADD231PS 64(DI), Y6, Y2
+	VFMADD231PS 96(DI), Y7, Y3
+	ADDQ $128, SI
+	ADDQ $128, DI
+	SUBQ $32, CX
+	JNZ loop32
+
+	VADDPS Y1, Y0, Y0
+	VADDPS Y3, Y2, Y2
+	VADDPS Y2, Y0, Y0
+	VEXTRACTF128 $1, Y0, X1
+	VADDPS X1, X0, X0
+	VHADDPS X0, X0, X0
+	VHADDPS X0, X0, X0
+	VZEROUPPER
+	MOVSS X0, ret+24(FP)
+	RET
