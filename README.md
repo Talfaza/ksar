@@ -423,13 +423,12 @@ into errors instead of kills, for debugging only.
 | `internal/sandbox`, `internal/agent` | One run end to end; the host–guest protocol |
 | `internal/registry`, `internal/termsafe` | Running VMs for `ps`/`stop`; terminal output filter |
 | `kernel/` | Guest kernel config and build script |
-| `PLAN.md` | Design notes and history |
 
 ## Roadmap
 
 - Multiple vCPUs per VM
 - `ksar pull` and `ksar images`: manage images without Docker
-- ioeventfd, and snapshots for even faster starts (built once and shelved, see PLAN.md)
+- ioeventfd, and snapshots for even faster starts
 
 ## License
 
