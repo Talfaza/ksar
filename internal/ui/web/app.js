@@ -899,7 +899,7 @@ function buildNewRun(pre, close) {
       else if (ai.state === 'chosen' && ai.choices.length > 1) {
         // Every option the model weighed, its pick first, grouped by the
         // part of the project it runs; picking one uses its environment.
-        const opt = (c, i) => h('option', { value: i, selected: c.command === form.command }, c.command);
+        const opt = (c, i) => h('option', { value: i, selected: c.command === form.command }, c.core || c.command);
         const parts = [...new Set(ai.choices.map(c => c.component || ''))];
         const select = h('select', { class: 'input mono', 'aria-label': 'Other commands the model considered',
           onchange: e => useOption(ai.choices[+e.target.value]) },

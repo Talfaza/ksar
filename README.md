@@ -1,614 +1,436 @@
-# Ksar
+<h1 align="center">
+  <img src="internal/ui/web/mascot.png" width="120" alt=""><br>
+  Ksar
+</h1>
 
-Run untrusted code in throwaway KVM microVMs, from your browser. One Go
-binary, no root.
+<p align="center">
+  <b>Run untrusted code in throwaway virtual machines, right from your browser.</b><br>
+  One Go binary · its own hypervisor on KVM · no root · nothing kept
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/desktop.jpg" width="900" alt="An Ubuntu desktop running in a Ksar VM, in a browser tab, next to the run's live stats and protections">
+</p>
+
+Downloaded a repo you don't trust? An installer, a script from a gist, code an
+AI agent just wrote? Run it in Ksar. Every run gets a fresh microVM that boots
+in about half a second, sees nothing of your machine, has no network unless you
+give it one, and is destroyed when it ends.
 
 ```sh
-make && make kernel   # once
-./ksar                # opens Ksar in your browser
+git clone https://github.com/Talfaza/ksar && cd ksar
+make && make kernel
+./ksar            # opens Ksar in your browser
 ```
 
-Pick an image and a command, or drop in a project folder or archive, and
-press Run: a fresh microVM boots in about half a second, runs it, streams
-the output to the page, and is destroyed. Nothing written inside survives
-the run. Need a screen? Pick a display size and you get a full Linux
-desktop (XFCE) in the browser tab, about 4 seconds after you click Run.
+> *Ksar* (قصر) is a fortified village of southern Morocco: what's inside the
+> walls stays inside.
 
-Ksar is its own virtual machine monitor: it talks to `/dev/kvm` directly
-instead of using QEMU or Firecracker, with a small set of devices written
-for this purpose. Everything the page does is also available from an
-optional command line (`ksar run`, `ksar ps`, ...).
+> [!WARNING]
+> Ksar is **alpha** software and has not had a security audit. It is built as
+> defense in depth (see [Security](#security)), but don't bet anything critical
+> on it yet.
 
-> *Ksar* (قصر) is a fortified village of southern Morocco: what's inside
-> the walls stays inside.
+## Highlights
+
+- **Throwaway VMs in ~0.5 s.** Any Docker image becomes the guest's
+  filesystem, read-only; everything a run writes lives in RAM and is gone
+  afterwards.
+- **Full Linux desktops in a browser tab.** Pick a display size and get Ubuntu,
+  Debian, Fedora, Arch or Alpine with XFCE, usable with keyboard and mouse,
+  about 4 seconds after you click Run.
+- **Drop a project, press Run.** Ksar works out what a folder or archive is
+  (Python, Node.js, Go, Rust, C, Make, shell, or several at once), picks the
+  image, the command and the network it needs, and starts its database if it
+  uses one. A tiny AI model, built in and running on your CPU, picks among the
+  commands.
+- **Secure by default.** No network card at all unless you ask; then only the
+  hosts you allow, through a separate proxy. The hypervisor locks itself down
+  with seccomp before your code runs.
+- **Its own hypervisor.** Ksar talks to `/dev/kvm` directly: no QEMU, no
+  Firecracker, no libvirt, no daemons. One static binary with its own guest
+  kernel (2.5 MB) and guest agent.
 
 ## Contents
 
-- [Requirements](#requirements)
-- [Build](#build)
-- [Web UI](#web-ui)
-- [Command line (optional)](#command-line-optional)
+- [Getting started](#getting-started)
+- [Using Ksar](#using-ksar): [runs](#runs) · [projects](#run-a-project) · [desktops](#desktops) · [network](#network) · [images](#images) · [history](#history)
+- [Security](#security)
 - [How it works](#how-it-works)
-- [Security model](#security-model)
 - [Performance](#performance)
+- [Command line (optional)](#command-line-optional)
 - [Development](#development)
-- [Status and roadmap](#status-and-roadmap)
+- [Roadmap](#roadmap)
 
-## Requirements
+## Getting started
 
-- Linux on x86_64 with KVM: `/dev/kvm` readable and writable by your user
-  (usually via the `kvm` group: `sudo usermod -aG kvm $USER`, then log in
-  again)
-- `/dev/vhost-vsock` (module `vhost_vsock`) for the fast path
-- Go 1.25 or newer
-- `mkfs.erofs` from erofs-utils, to turn images into disks
-  (`dnf install erofs-utils` / `apt install erofs-utils`)
+### Requirements
+
+- **Linux on x86-64 with KVM.** Your user needs read and write access to
+  `/dev/kvm`, usually through the `kvm` group:
+  `sudo usermod -aG kvm $USER`, then log in again.
+- **`/dev/vhost-vsock`** (`sudo modprobe vhost_vsock`).
+- **Go 1.25+** and **erofs-utils** (`dnf install erofs-utils` / `apt install erofs-utils`).
 - To build the guest kernel: `gcc make flex bison bc perl curl xz` and the
-  libelf headers (`elfutils-libelf-devel` / `libelf-dev`)
-- Optional: Docker, to export images (`make alpine`)
-- Optional: a systemd user session, for per-run cgroup limits
+  libelf headers (`elfutils-libelf-devel` / `libelf-dev`).
+- Optional: **Docker**, to import images; a **systemd user session**, for
+  per-run CPU and memory limits.
 
 Ksar never needs root, and refuses to run as root unless told to.
 
-## Build
+### Build and start
 
 ```sh
-make            # ksar (with the guest agent embedded), plus a test initramfs
-make kernel     # the Ksar guest kernel -> build/bzImage (downloads Linux LTS, ~1-2 min on 16 cores)
-make alpine     # export alpine:3.20 to build/alpine.tar (needs Docker)
+make          # ksar, with the guest agent embedded
+make kernel   # the guest kernel -> build/bzImage (downloads Linux LTS, ~1–2 min)
+./ksar        # serves the web UI on 127.0.0.1 and opens your browser
 ```
 
-`ksar` is a static, pure-Go binary (`CGO_ENABLED=0`, required by the
-seccomp lockdown). The guest agent is embedded in it, so `ksar` plus a
-kernel is all you need to deploy.
+Then, in the page:
 
-`ksar run` uses the Ksar kernel automatically once it's built (found at
-`build/bzImage` next to the binary, `~/.local/share/ksar/bzImage`, or
-`$KSAR_KERNEL`). Without it, Ksar falls back to the host kernel in legacy
-mode (see below).
+1. **Images → Import** an image from Docker, e.g. `alpine:3.20` or
+   `python:3.12-slim`.
+2. **New Run**, type a command, press **Run**. Or **Run a Project** and drop in
+   a folder, `.zip` or `.tar.gz`.
 
-## Web UI
+`./ksar ui` does the same without opening a browser and prints the sign-in
+link instead (handy over SSH). Settings shows a checklist of what Ksar found on
+your machine.
 
-```sh
-ksar               # serve the UI and open it in your browser
-ksar ui            # serve it and print the sign-in link (e.g. over SSH)
-```
+## Using Ksar
 
-A local control panel to start runs, watch their output live, type to
-their stdin, stop them, and manage images. It looks like this: a runs
-list with status and exit codes; a new-run form with secure defaults; a
-live run page with a terminal (colors kept), the guest kernel log, cgroup
-memory and CPU, and the protections that actually apply to that run; an
-images page that imports from Docker; and settings with system checks.
+### Runs
 
-**Run history.** Finished runs, with their output, are kept in
-`~/.local/share/ksar/runs` (only your user can read them) and are still
-there after Ksar restarts; the latest 200 are kept. Delete one from its
-page or clear them all in Settings; `ksar ui -history ""` keeps nothing.
+<img src="docs/screenshots/run.jpg" width="820" alt="A finished run: its output, exit code, timings and the protections that applied to it">
 
-**Desktops, ready ahead of time.** The first display run of an image
-installs a minimal XFCE into a cached layer (about a minute for Debian,
-longer for Fedora or Arch). **Prepare Desktop** on the Images page does
-that in the background, in the same kind of sandboxed install VM, so the
-first display run starts in seconds too.
+A run is an image, a command and a few limits. Its page streams the output
+live (colors kept), and shows the guest kernel's log, memory and CPU, every
+network connection, and the protections that actually applied to it. You can
+type to the command's stdin, stop it, or run it again. Defaults are strict:
+256 MB of memory, a 1-minute timeout and no network; Settings changes them.
 
-**Run a project.** Click **Run a Project** (or drop a folder, `.zip` or
-`.tar.gz` into the new-run form) and Ksar works out what it is from its
-files and fills in the run: Python (`requirements.txt`, `pyproject.toml`,
-`main.py`, tests), Node (`package.json` start or test script), Go
-(`go.mod`), Rust (`Cargo.toml`), Make, C/C++ or a shell script. It picks
-the image (importing e.g. `python:3.12-slim` from Docker on first use), a
-command that installs dependencies and runs it, and a network allow list
-limited to that language's package registry for the install. Projects
-with several parts (a Python API and a Node front end, a Go service with
-Python scripts, a C program in a subfolder) are searched as a whole, three
-folders deep: each part gets its own commands, run from its folder with
-its own image, and a top-level `run.sh` or Makefile that drives them gets
-one image with every runtime it calls (e.g. `node:22`, which has Python
-too) and every registry it needs (or, for Node.js with Go or Rust, a
-checksum-pinned toolchain). **Databases come along:** a project whose
-manifests use MySQL, PostgreSQL or Redis gets that server installed from
-the image's own distribution mirror and started inside the same VM, on
-127.0.0.1 only, before its command; when its `.env` or
-`docker-compose.yml` names a local database (a DSN, a URL or `DB_*`
-settings, also via a compose service name like `db`), that user and
-database are created, otherwise `app`/`app`, and `DATABASE_URL` and
-friends are exported. Values from the project are only used when they
-match a strict character set. Node runs get `CI=true` and `HUSKY=0` (no
-watch modes, no git hooks), and a project with git hooks gets git and an
-empty repository. A project with several parts runs all of them by
-default; the model ranks the alternatives. Review or
-edit anything, press Run, and the output streams in. **The command is chosen by a tiny AI model built into Ksar:**
-SmolLM2-135M-Instruct, run on the CPU by Ksar's own pure-Go inference
-code (no GPU, no Ollama, no cgo; an AVX2 kernel where available). It is
-downloaded once (about 260 MB, pinned revision and checked by SHA-256)
-from Settings, from the project card, or with `ksar suggest -download`.
-It doesn't write commands: Ksar builds a short list of plausible ones
-from the project's files (each entry point, script and Makefile target,
-with and without the dependency install), and the model picks the most
-likely, in about a second. The card shows its pick and every option it
-weighed. So it can't produce nonsense, a malicious README can't make it
-suggest anything outside that list, and the network policy never comes
-from it. Without the model, rules choose. Review the filled-in form and
-press Run. From the terminal:
+### Run a project
 
-```sh
-ksar suggest ./my-project      # how Ksar would run it, and the model's ranking
-```
+<img src="docs/screenshots/project.jpg" width="820" alt="The project card: a Python project with PostgreSQL, the command chosen by the built-in model">
 
-Archives are
-unpacked with the same rules as folder uploads: paths must stay inside
-the folder, symlinks and special files are skipped, and size and file
-limits apply to what they expand to. Nothing from the project runs on
-your machine; detection only reads file names and small manifests.
+**Run a Project** (or drop a folder or archive into any new run) and Ksar fills
+in the run for you:
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `-addr` | `127.0.0.1:8765` | Listen address. Loopback IPs only; port 0 picks a free one. |
-| `-images DIR` | `~/.local/share/ksar/images` | Directory of root filesystem tars (symlinks allowed). |
-| `-kernel FILE` | auto | Kernel for runs. |
-| `-open` | off | Open the sign-in link with `xdg-open` (what plain `ksar` does). |
-| `-history DIR` | `~/.local/share/ksar/runs` | Where finished runs are kept across restarts; `""` keeps none. |
+- **What it is.** Python (`requirements.txt`, `pyproject.toml`, entry points,
+  tests), Node.js (`package.json` scripts), Go, Rust, C/C++ (even in a
+  subfolder, even with Turbo C's `conio.h`), Make, or shell scripts. It looks
+  three folders deep, so a Python API next to a Node front end is one project
+  with two parts, and by default all parts run.
+- **Where it runs.** The image each part needs (imported from Docker the first
+  time), or one image with every runtime a top-level `run.sh` calls. When no
+  image has both runtimes (Node.js with Go or Rust), the run installs the
+  missing one first, from a pinned release checked by SHA-256.
+- **What it may reach.** Only the package registries the install needs
+  (`pypi.org`, `registry.npmjs.org`, `proxy.golang.org`, ...), and nothing at
+  all for a project with no dependencies.
+- **What it needs next to it.** A project that uses **MySQL, PostgreSQL or
+  Redis** gets that server, installed from the image's own distribution and
+  started inside the same VM on 127.0.0.1. If its `.env` or
+  `docker-compose.yml` names a local database (a connection string, a URL,
+  `DB_*` settings, or a compose service such as `db`), that user and database
+  are created; otherwise `app`/`app`. `DATABASE_URL` and friends are set.
+- **Friendly defaults.** Node runs get `CI=true` (no watch modes) and
+  `HUSKY=0`; projects with git hooks get git and an empty repository; Python
+  output isn't buffered.
 
-How it's kept safe:
+The command is picked by **SmolLM2-135M-Instruct**, a small language model
+that Ksar runs itself, in pure Go on the CPU (no GPU, no Ollama, no Python;
+AVX2 where available). It's downloaded once from Settings (about 260 MB, a
+pinned revision checked by SHA-256) and picks in about a second. It never
+writes commands: Ksar builds the candidates from the project's files and the
+model only ranks them, so a malicious README can't talk it into anything, and
+it never decides the network policy. Without the model, rules pick.
 
-- **Each run is its own `ksar run` process**, with the same seccomp
-  lockdown and cgroup scope as on the command line. The UI server never
-  runs guest code.
-- **Loopback only**, and the `Host` header must match exactly (stops DNS
-  rebinding).
-- **Startup token:** the printed link sets an `HttpOnly`,
-  `SameSite=Strict` session cookie and redirects to a clean URL. Restart
-  `ksar ui` for a new one.
-- **Origin checks** on every state-changing request, so pages from other
-  websites, or from other servers on your machine (other ports), can't
-  start or stop runs.
-- **Strict Content-Security-Policy**, no framing, nothing loaded from the
-  internet. Guest output is filtered like terminal output, then inserted
-  only as text, never as HTML.
+Nothing from the project runs on your machine: detection only reads file names
+and small manifests, and archives are unpacked with strict rules (paths stay
+inside the folder, links and special files are skipped, size limits apply to
+what they expand to). You can review and edit everything before pressing Run.
 
-Stopping the UI stops its runs.
+### Desktops
 
-## Command line (optional)
+Pick a display size (1024 × 768 up to 1920 × 1080) and the run gets a screen,
+keyboard and mouse, shown on its **Display** tab. Leave the command empty for
+just the desktop, or name a program to open on it (e.g. `xfce4-terminal`).
 
-Everything below is optional: the web UI starts each run as one of these
-`ksar run` processes, and they are there for scripts and terminals.
+Any Alpine, Debian, Ubuntu, Fedora or Arch image works, even one without X:
+the first time, Ksar installs a minimal XFCE for it, inside a VM that can reach
+only that distribution's package mirrors, and keeps the result as a read-only
+layer. That takes a minute or more, once. **Prepare Desktop** on the Images
+page does it ahead of time, so even the first display run starts in seconds.
+After that, every desktop is fresh.
 
-```
-ksar run [flags] [--] COMMAND [ARGS...]
-```
+The screen path is deliberately simple: the guest draws into plain memory that
+Ksar only reads, input only goes in, the clipboard never crosses, and only the
+signed-in page can view the screen.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `-image FILE` | none | Root filesystem as a tar, e.g. from `docker export`. Without it the guest contains only the agent. |
-| `-mem SIZE` | `256M` | Guest RAM (e.g. `512M`, `2G`; at most 3 GiB). |
-| `-timeout D` | `1m` | Kill the VM after this long (`0` = never). |
-| `-i` | off | Forward ksar's stdin to the command. |
-| `-copy HOST:GUEST` | | Copy a host file or directory into the guest before running (repeatable). |
-| `-e KEY=VALUE` | | Set an environment variable (repeatable). |
-| `-w DIR` | `/` | Working directory inside the guest. |
-| `-display SIZE` | none | Give the guest a screen, keyboard and mouse: `on` (1280x800) or e.g. `1920x1080`. See [Display](#display). |
-| `-desktop` | off | With `-display` (implied): start X and XFCE, then run COMMAND on the desktop (no COMMAND: just the desktop). Images without a desktop get one installed once, see below. |
-| `-layer TAR` | | Stack a tar (e.g. from `-save-changes`) read-only on the image (repeatable, topmost first). |
-| `-save-changes FILE` | | If COMMAND exits 0, save everything it changed in the filesystem to FILE as a tar, usable with `-layer`. |
-| `-vnc ADDR` | `127.0.0.1:0` | With `-display`: where to serve VNC, `127.0.0.1:PORT` (a password is printed) or `unix:PATH` (repeatable). |
-| `-net MODE` | `none` | Network access: `none` (no network card), `allow` (only `-allow` hosts) or `internet` (any public address). See [Networking](#networking). |
-| `-allow RULE` | | With `-net allow`: a host the guest may reach (repeatable, or comma-separated). |
-| `-v` | off | Show the guest kernel log, timings and the cgroup scope. |
-| `-raw` | off | Don't filter control sequences in output sent to a terminal. |
-| `-cgroup MODE` | `auto` | Per-run cgroup limits via a systemd user scope: `auto`, `on`, `off`. |
-| `-kernel FILE` | auto | bzImage to boot. |
-| `-legacy` | off | Use the serial channel and an in-RAM image even with the Ksar kernel. |
-| `-lockdown` | on | Seccomp lockdown before the guest runs. Disable only to debug. |
-| `-agent FILE` | embedded | Use another ksar-agent binary. |
-| `-id NAME` | random | This VM's id for `ksar ps` / `ksar stop` (lower-case letters, digits, `-`). |
-| `-label TEXT` | | What `ksar ps` shows instead of the command. |
-| `-allow-root` | off | Allow running as root (not recommended). |
+### Network
 
-### Exit codes
+Runs have **no network card** unless you choose otherwise:
 
-Like `docker run`: the command's own exit code, or
+- **Off** (default): the guest has only `lo`.
+- **Allow list**: only the hosts you list, e.g. `pypi.org`, `*.npmjs.org`,
+  `github.com:443`.
+- **Internet**: any public address.
 
-| Code | Meaning |
-|---|---|
-| 124 | The VM hit `-timeout` and was killed |
-| 125 | Ksar itself failed (bad flags, boot failure, ...) |
-| 126 | The command could not be executed |
-| 127 | The command was not found |
-| 128+N | The command was killed by signal N (e.g. 137 = SIGKILL) |
+Even with a network, the guest never touches your machine's network directly.
+Its packets go to a separate, locked-down Ksar process running its own TCP/IP
+stack (gVisor's netstack), which checks each DNS lookup and connection and
+makes it again as an ordinary connection. Your local network, your machine's
+own addresses and cloud metadata endpoints are always blocked, and DNS answers
+pointing there are dropped. Every lookup and connection is listed on the run's
+**Network** tab.
 
-### Examples
+### Images
 
-```sh
-# Run a script from the host
-ksar run -image build/alpine.tar -copy ./test.sh:/work/test.sh -w /work -- sh test.sh
+Images are root filesystems exported from Docker. Import any image by name on
+the Images page (Docker needed for this step only), or put `docker export`
+tars in `~/.local/share/ksar/images`. Each is converted once to a compressed
+read-only disk (EROFS) and cached; the image's environment and working
+directory are kept. Tested with Alpine, Debian, Ubuntu, Fedora, Arch and
+language images (Python, Node.js, Go, GCC).
 
-# Test a whole project checkout (the directory is copied in; your copy is untouched)
-ksar run -mem 1G -image python.tar -copy ./myproject:/work/myproject -w /work/myproject -- python3 -m pytest
+### History
 
-# Pipe data through a sandboxed command
-sort -R names.txt | ksar run -i -image build/alpine.tar -- sort -u
+Finished runs, with their output, stay after Ksar restarts (the latest 200, in
+`~/.local/share/ksar/runs`, readable only by you). Delete a run from its page
+or clear them all in Settings; `ksar ui -history ""` keeps nothing.
 
-# Language runtimes come from their images
-docker create --name tmp python:3.12-slim && docker export tmp -o python.tar && docker rm tmp
-ksar run -mem 512M -image python.tar -copy ./script.py:/work/script.py -- python3 /work/script.py
+## Security
 
-# Any distro Docker can export
-docker create --name tmp fedora:41 && docker export tmp -o fedora.tar && docker rm tmp
-ksar run -image fedora.tar -- dnf --version
+**Threat model:** the code in the VM is hostile and is root in the guest. It
+controls the guest kernel, so it can send anything to Ksar's devices. The goal
+is that it can't affect your machine beyond the CPU, memory and time it was
+given, and that a bug in Ksar's device code doesn't hand it your machine.
 
-# More memory, longer timeout, see what happens inside
-ksar run -v -mem 1G -timeout 5m -image build/alpine.tar -- sh -c 'apk info | wc -l'
-```
+Layers, from the inside out:
 
-### Networking
+1. **Hardware virtualization.** The guest has its own kernel under KVM. Its
+   only ways out are the few devices Ksar implements, and vhost-vsock.
+2. **Small, validated device code.** Every value the guest controls (ring
+   indexes, descriptor addresses and lengths, register writes, frame sizes) is
+   checked before use, and all guest memory access goes through one
+   bounds-checked function. Misbehaving queues are shut down. All of it is
+   fuzzed.
+3. **Lockdown.** Before the guest runs, Ksar restricts itself on every thread:
+   a seccomp allowlist (no opening files, no sockets, no exec, no new
+   processes, no executable memory; only the KVM and vhost ioctls it needs),
+   `no_new_privs`, non-dumpable (no ptrace or `/proc/PID/mem` from your other
+   processes), no core dumps.
+4. **Limits.** Each run gets its own systemd scope: memory capped, no swap
+   (guest memory never reaches disk), at most 256 tasks and 1.5 CPUs, and a
+   timeout.
+5. **Unprivileged.** Ksar needs only `/dev/kvm` and `/dev/vhost-vsock`.
+6. **A trusted agent channel.** Only a connection from the VM's own vsock
+   address, assigned by the kernel, is accepted as the guest agent.
+7. **Output filtering.** Guest output shown in the page or a terminal keeps
+   its colors, but clipboard writes, title changes and other control sequences
+   are removed. It is never inserted as HTML.
 
-Runs have **no network** unless you ask for one: the guest doesn't even
-get a network card. With `-net`, it gets one (`eth0`, 10.0.2.15), and
-every packet it sends goes to a separate Ksar process, the network proxy.
-The proxy runs its own userspace TCP/IP stack (gVisor's netstack), so the
-guest never touches your machine's network directly. Each connection the
-guest opens is checked against the policy, then made again by the proxy
-as an ordinary connection from your machine. DNS is answered by the proxy
-too.
+**The web UI** listens on 127.0.0.1 only, checks the `Host` header (no DNS
+rebinding) and the `Origin` of every request (other websites and other local
+ports can't drive it), signs you in with a one-time link that sets an
+`HttpOnly`, `SameSite=Strict` cookie, and has a strict Content-Security-Policy
+with nothing loaded from the internet. It never runs guest code itself: each
+run is a separate, locked-down `ksar run` process.
 
-```sh
-# Install dependencies from PyPI, and nothing else
-ksar run -net allow -allow pypi.org,files.pythonhosted.org \
-  -image build/python.tar -- sh -c 'pip install requests && python3 app.py'
+**Isolation between runs:** the image disk is read-only and every run gets a
+fresh RAM layer, so nothing one run writes is seen by the next.
 
-# Any public address
-ksar run -net internet -image build/alpine.tar -- wget -qO- https://example.com
-```
+**Known limits:**
 
-Allow rules: `pypi.org` (that name exactly), `*.pythonhosted.org` (its
-subdomains), `github.com:443` (one port), `1.2.3.4`, `10.1.0.0/16:8080`.
+- No security audit has been done.
+- The hypervisor is one process; a separate jailed process (namespaces, like
+  Firecracker's jailer) would add a layer.
+- vhost-vsock runs in the host kernel, so its bugs are kernel bugs: the price
+  of its speed.
+- "Internet" mode lets code reach anything public. Prefer an allow list.
+- Database passwords read from a project's `.env` appear in its command, and
+  so in your local run history.
 
-What the policy enforces:
-
-- **Names.** In `allow` mode, names off the list don't resolve. A
-  connection is allowed only to an address the proxy's own DNS returned for
-  an allowed name (or an allowed address), so the guest can't reach an
-  address by guessing it or by bringing its own resolver.
-- **No local network.** Private, loopback, link-local (including cloud
-  metadata at 169.254.169.254), carrier-grade NAT, multicast and reserved
-  ranges, and every address of your own machine, are blocked in both
-  modes. DNS answers pointing there are dropped (no DNS rebinding). The
-  only way through is an explicit address rule, e.g.
-  `-allow 192.168.1.10:8080`.
-- **What is checked is what is reached.** The proxy connects to exactly
-  the address the guest dialed, after checking it, with no second lookup.
-- **TCP and DNS only.** Other UDP and ICMP don't leave the proxy (ping to
-  outside addresses fails rather than being faked). IPv4 only.
-- **Logged.** Blocked lookups and connections are printed to stderr as
-  `[ksar] net: …` (all activity with `-v`), and the web UI shows every
-  lookup and connection on the run's Network tab.
-- **Contained.** The proxy is its own process with its own seccomp filter
-  (IP sockets and read-only file opens only: no exec, no file writes, no
-  Unix or raw sockets), in the run's cgroup, and dies with the run. The
-  VMM stays as locked down as before: it only moves frames over a
-  socket pair it opened before lockdown.
-
-Throughput is about 50 MB/s, plenty for installing dependencies.
-`internet` mode lets the code reach anything public, including sending
-mail or attacking other hosts, so prefer an allow list.
-
-### Display
-
-Runs have no screen unless you ask for one. With `-display`, the guest
-gets a framebuffer plus a virtio keyboard and tablet, and you watch and
-use it over VNC, or on the run's **Display** tab in the web UI.
-
-The easy way is `-desktop` (what the web UI does when you pick a display
-size): it starts Xorg and XFCE and runs your command on that desktop, or
-just the desktop if you give no command. **Any Alpine, Debian, Ubuntu,
-Fedora or Arch image works**, even one with no X at all:
-
-```sh
-ksar run -mem 1536M -timeout 30m -desktop -image build/debian.tar
-ksar run -mem 1536M -timeout 30m -desktop -image build/ubuntu.tar -- xfce4-terminal
-```
-
-The first time, Ksar installs a minimal XFCE for that image, which takes
-a few minutes. The install runs the image's own package manager, so it
-happens in a Ksar VM like any run, whose network reaches only that
-distribution's package mirrors (e.g. `deb.debian.org`). Only the files
-the install changed come back (`-save-changes`), stored as a separate
-read-only layer in `~/.cache/ksar/desktop`. Later display runs stack that
-layer on the untouched image (`-layer`) and start in under a second.
-Deleting the image or clearing the disk cache removes its layer.
-
-To set it up by hand instead, any image with Xorg works;
-`examples/desktop` builds a small Alpine one with Xorg, xterm and XFCE:
-
-```sh
-docker build -t ksar-desktop examples/desktop
-docker create --name d ksar-desktop && docker export d > build/desktop.tar && docker rm d
-
-ksar run -mem 1536M -timeout 30m -display 1280x800 -image build/desktop.tar -- \
-  sh -c 'Xorg :0 -nolisten tcp & sleep 2; dbus-launch --exit-with-session startxfce4'
-# [ksar] display 1280x800: vnc://127.0.0.1:40123 (password k3m8...)
-```
-
-Then open that address in any VNC viewer (e.g. `vncviewer 127.0.0.1::40123`).
-With a display, the agent sets `DISPLAY=:0` and writes an Xorg config
-for the virtual keyboard and tablet (the guest has no udev to find them).
-
-How it is built, and why it is safe:
-
-- **The screen is plain memory.** The kernel is told about a linear
-  framebuffer (as firmware would) and drives it with `simpledrm`. Ksar
-  only reads that memory; there is no guest display protocol to parse.
-- **Input is one way.** The keyboard and tablet are virtio-input devices
-  that Ksar only writes events to. What the guest sends back (keyboard
-  LEDs) is discarded.
-- **No clipboard.** Clipboard text from the viewer is dropped, and
-  nothing in the guest can read your clipboard.
-- **Viewers are checked.** VNC is served on loopback only, with a random
-  password over TCP; a `unix:` socket is created mode 0600. The web UI
-  uses a private socket and reaches it only through its signed-in session
-  (with an Origin check on the WebSocket). Every viewer message is size
-  checked, and the server is fuzzed.
-- **The lockdown is unchanged** except that the VMM may now read its own
-  socket address after accepting a viewer, and set `TCP_NODELAY`, the one
-  socket option Go sets on accepted TCP connections.
-
-Images are converted to EROFS disks on first use and cached in
-`~/.cache/ksar/images` (keyed on the tar's path, size and mtime). Delete
-that directory to reclaim space.
-
-**Image settings.** `docker export` keeps only the filesystem, not the
-image's environment (for example the `PATH` where a Go, Java or Rust
-image installs its toolchain) or working directory. Ksar reads them from
-an optional file next to the tar, `NAME.tar.json`:
-
-```json
-{ "env": ["PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin", "GOPATH=/go"], "workdir": "/src" }
-```
-
-The web UI's Docker import writes it automatically. To make one by hand:
-`docker inspect IMAGE --format '{{json .Config}}'` has the values. `-e`
-and `-w` override what the file sets.
-
-**Copying directories.** `-copy DIR:/guest/path` (and "Add folder" in the
-web UI) copies a directory tree, with permissions and empty directories,
-as one stream. The directory is treated as untrusted: symlinks are copied
-as links and never followed, so a link like `notes -> ~/.ssh/id_rsa`
-can't pull your key into the guest; device files, sockets and pipes are
-skipped. Browsers don't send permissions, so in the web UI files starting
-with `#!` are made executable and the rest are not.
-
-**Writable space.** Writes go to a RAM-backed layer of up to half the
-guest RAM (about 120 MB with the default 256 MB). Give more `-mem` to
-commands that write a lot.
-
-Tested with Alpine, Debian, Ubuntu, Fedora and Arch Linux images, all in
-the default 256 MiB.
-
-### VM ids: `ksar ps` and `ksar stop`
-
-Every VM has an id: random 12 characters, or your own with `-id NAME`.
-`-label TEXT` sets what `ksar ps` shows instead of the command. Runs
-started from the web UI use the UI's run id, so both show the same one.
-
-```
-$ ksar ps
-ID            STATUS   UPTIME  MEMORY   IMAGE   COMMAND
-34afe4c64e54  running  2m05s   1.1 GB   debian  desktop  [display]
-web-test      running  14s     51.0 MB  alpine  python3 app.py  [net: allow]
-$ ksar stop 34af web-test     # any unique prefix works
-```
-
-`ksar ps -a` also shows VMs that exited in the last hour, with their exit
-codes; `-q` prints only ids and `-json` everything. The id is also the
-cgroup scope's name (`ksar-<id>-….scope`) and is visible inside the guest
-in `/run/ksar/id`. `ksar stop` sends SIGTERM (the VM ends with 143), then
-SIGKILL after `-t` (5 s).
-
-The list lives in `$XDG_RUNTIME_DIR/ksar/vms`. A running ksar is locked
-down and may not create or delete files, so it opens its entry before
-lockdown and only rewrites it in place afterwards; entries of processes
-that are gone (or whose PID now belongs to someone else) are cleaned up
-by `ksar ps`.
-
-### Other commands
-
-`ksar boot` boots a kernel with an initramfs and shows its console, and
-`ksar initramfs` packs a static binary into an initramfs. `ksar hello`
-runs a tiny hand-assembled real-mode guest. These are the building blocks
-from earlier development stages, kept for debugging.
+Tested against hostile workloads, all contained: reaching the network, looking
+for host files and SSH keys, writing to the image, fork bombs and infinite
+loops, memory and disk exhaustion, kernel module loading, and terminal escape
+injection.
 
 ## How it works
 
 ```
- ksar (one static Go process, per run)
- ├── CLI: flags, image cache, cgroup scope, lockdown
- ├── VMM ─────────── /dev/kvm: 1 vCPU, guest RAM, in-kernel irqchip + PIT
- │   ├── 8250 UART (COM1)      guest kernel console
- │   ├── virtio-blk            the image, read-only (/dev/vda)
- │   ├── vhost-vsock           agent channel; data path in the host kernel
- │   ├── virtio-net (-net)     frames over a socket pair to the network proxy
- │   ├── framebuffer (-display) guest memory the VMM reads; served over VNC
- │   ├── virtio-input ×2        keyboard and tablet, events from the viewer
- │   └── CMOS clock, reset line
+ ksar (one static Go process per run)
+ ├── VMM ─────────── /dev/kvm: guest RAM, vCPU, in-kernel interrupt controller
+ │   ├── virtio-blk              the image, read-only
+ │   ├── vhost-vsock             the agent channel (data path in the host kernel)
+ │   ├── virtio-net              only with a network: frames to the proxy
+ │   ├── framebuffer + virtio-input   only with a display: screen, keyboard, tablet
+ │   └── serial console, clock, reset line
  ├── session ◄──── vsock ────► ksar-agent (PID 1 in the guest)
- │                             mounts the image under a RAM overlay,
- │                             runs the command, streams its I/O
- └── ksar net-proxy (only with -net; its own process and seccomp filter)
-     userspace TCP/IP (gVisor netstack), policy, DNS, logging
+ │                             RAM overlay on the image, runs the command
+ └── ksar net-proxy (only with a network; its own process and seccomp filter)
+     userspace TCP/IP (gVisor netstack), DNS, policy, connection log
+
+ ksar ui  ── the web UI: starts each run as a ksar process, streams it to the page
 ```
 
-1. **Image.** A Docker export tar is converted once with `mkfs.erofs --tar`,
-   which keeps ownership and modes without root.
-2. **Boot.** Ksar loads the kernel with the x86 64-bit boot protocol (no
-   BIOS), sets up long mode and page tables itself, and starts the vCPU.
-   Devices are virtio-mmio, announced on the kernel command line. There is
-   no PCI or ACPI.
-3. **Root switch.** The agent is the initramfs's only program. It mounts
-   the image read-only, stacks a tmpfs on it with overlayfs and switches
-   root into it. The agent binary is then invisible to the guest, and
-   writes only ever reach RAM.
-4. **Session.** The agent connects to the host over vsock and speaks a
-   small framed protocol: file transfers, exec, stdin/stdout/stderr, exit
-   status. Host-to-guest traffic is credit flow controlled.
-5. **Teardown.** When the exit status arrives, Ksar stops the vCPU and
-   destroys the VM.
+1. **Image.** A Docker export becomes an EROFS disk once (`mkfs.erofs --tar`,
+   no root needed), cached by content.
+2. **Boot.** Ksar loads the guest kernel with the x86 64-bit boot protocol,
+   sets up long mode and page tables itself and starts the vCPU. No BIOS, no
+   PCI, no ACPI: devices are virtio-mmio, announced on the kernel command line.
+3. **Root switch.** The agent mounts the image read-only under a tmpfs overlay
+   and switches into it, so writes only ever reach RAM.
+4. **Session.** The agent connects back over vsock with a small framed,
+   flow-controlled protocol: files in, command, output, exit status.
+5. **Teardown.** When the command exits, the VM is destroyed.
 
-**The guest kernel** (`kernel/ksar.config`, applied on top of
-`tinyconfig`) is Linux LTS with only what a sandbox needs: virtio-mmio,
-blk, vsock, net, input, simpledrm, EROFS, overlayfs, ext4, tmpfs, namespaces, seccomp. No modules,
-PCI, ACPI, USB or graphics. It is 2.5 MB and reaches userspace in ~0.13 s.
-The build fails if any requested option gets silently dropped.
-
-**Legacy mode** works with any bzImage (e.g. the host's `/boot/vmlinuz-*`):
-the image is unpacked into the initramfs (RAM) and the agent talks over a
-second serial port. It's slower (~130 KB/s I/O) and needs about 2.5x the
-image size in RAM, but needs no kernel build.
-
-## Security model
-
-**Threat:** the code inside the VM is hostile and has root in the guest. It
-controls the guest kernel, so it can send anything to Ksar's devices:
-malformed virtqueues, bogus register writes, oversized or corrupt protocol
-frames, hostile terminal output.
-
-**Goal:** it can't affect the host beyond the resources it was given, and a
-bug in Ksar's device code doesn't hand it your machine.
-
-Layers, from the inside out:
-
-1. **Hardware virtualization.** The guest runs under KVM with its own
-   kernel. Its only ways out are the devices Ksar emulates and vhost-vsock.
-2. **Small, validated device code.** Few devices; every guest-controlled
-   value (ring indices, descriptor addresses and lengths, chain links,
-   register writes, frame sizes) is checked before use, and all guest
-   memory access goes through one bounds-checked function. Queues that
-   misbehave are shut down, not trusted. All of this is fuzzed
-   (`make fuzz`), with a guard region past guest RAM to catch
-   out-of-bounds writes.
-3. **Lockdown.** After the VM is built and before the guest runs, Ksar
-   restricts itself, on every thread:
-   - a seccomp allowlist: no opening files, no sockets, no exec, no new
-     processes, no executable memory; ioctls limited to `KVM_RUN`,
-     `KVM_IRQ_LINE` and vhost
-   - `no_new_privs`, and non-dumpable: other processes of your user can't
-     ptrace Ksar or read guest memory through `/proc/PID/mem`
-   - no core dumps (they would contain guest memory)
-4. **Cgroups.** Each run gets a systemd user scope: memory capped at guest
-   RAM plus headroom, no swap (guest memory never reaches disk), at most
-   256 tasks and 1.5 CPUs.
-5. **Unprivileged.** Ksar needs only `/dev/kvm` and `/dev/vhost-vsock`,
-   and refuses to run as root.
-6. **The agent channel.** Ksar listens on vsock and the agent connects out.
-   Only a connection from the VM's own CID, which the kernel assigns and
-   nobody can forge, is accepted. Other local processes and other VMs can't
-   pose as the agent.
-7. **Terminal output.** Output headed for a terminal is filtered: colors
-   pass, but clipboard writes (OSC 52), title changes, cursor movement,
-   terminal resets and other control sequences are removed. Pipes and
-   files get the exact bytes. `-raw` disables this.
-
-**Isolation between runs:** the image disk is read-only and every run gets
-a fresh RAM overlay, so nothing a run writes is visible to the next.
-
-**What the guest can do:** use its CPU and RAM up to the limits, until
-the timeout. By default it has no network: there is no network device at
-all. With `-net` it reaches only what the policy allows, through the
-proxy (see [Networking](#networking)).
-
-**Known limits:**
-
-- The VMM is one process. A separate jailed VMM process (user, mount and
-  network namespaces, like Firecracker's jailer) would add a layer.
-  Landlock isn't used because it restricts only the calling thread, and Go
-  already has many threads when setup ends; seccomp already forbids
-  opening files and sockets.
-- vhost-vsock runs in the host kernel, so its bugs are kernel bugs. This is
-  the trade-off for its speed.
-- Output sent to pipes and files is not filtered, by design.
-- No security audit has been done. Treat Ksar as defense in depth, not a
-  guarantee.
-
-## Tested with real projects
-
-Each ran its own test suite inside a VM with no network, dependencies
-baked into the image, four VMs at once:
-
-| Project | Command | Result |
-|---|---|---|
-| [more-itertools](https://github.com/more-itertools/more-itertools) (Python) | `python3 -m pytest` | 765 tests + 21,194 subtests passed, 20 s, 1 GB |
-| [node-semver](https://github.com/npm/node-semver) (Node.js) | `npm test --ignore-scripts` (tap) | passed, 100% coverage, 38 s, 1.5 GB |
-| [google/uuid](https://github.com/google/uuid) (Go) | `go test ./...` (compiled in the VM) | passed, 17 s, 1 GB |
-| [cJSON](https://github.com/DaveGamble/cJSON) (C) | cmake build + `ctest` | 19/19 passed, 8 s, 1 GB |
-
-And hostile workloads, all contained with the host unaffected: reaching
-the internet (no network interface but `lo`), finding host files or SSH
-keys, writing to the image disk (read-only), a fork bomb and an infinite
-loop (killed at the timeout), holding 1.5 GB in a 256 MB guest (the guest's
-OOM killer stops it), filling the disk (only the RAM layer fills), loading
-kernel modules or triggering sysrq (not supported by the guest kernel),
-and terminal escape injection (filtered).
+The guest kernel (`kernel/ksar.config`, on top of `tinyconfig`) is Linux LTS
+with only what a sandbox needs: virtio, EROFS, overlayfs, tmpfs, namespaces,
+seccomp, a framebuffer. No modules, PCI, ACPI or USB. It reaches userspace in
+about 0.13 s.
 
 ## Performance
 
-On a 16-core laptop (Intel, Fedora 41), with the Ksar kernel:
+On a 16-core Intel laptop (Fedora 41):
 
 | | Time |
 |---|---|
-| `ksar run -- true` (boot, run, teardown) | ~0.2–0.5 s |
-| 4 MB through stdin, checksummed | ~0.24 s total |
-| 50 MB through stdin, checksummed | ~0.6 s total |
-| Arch Linux image, cached | ~0.5 s |
-| First use of a 400 MB image (EROFS conversion) | +0.9 s |
+| Boot, run a command, tear down | ~0.2–0.5 s |
+| Click Run → usable Ubuntu XFCE desktop in the browser | ~4 s |
+| First desktop for an image (one-time install, Debian) | ~40–50 s |
+| 50 MB through stdin, checksummed | ~0.6 s |
+| First use of a 400 MB image (disk conversion) | +0.9 s |
+| A project with PostgreSQL or MySQL (install + start + run) | ~25–40 s |
+| Network throughput through the proxy | ~50 MB/s |
+
+Real test suites, run inside VMs: [more-itertools](https://github.com/more-itertools/more-itertools)
+(765 tests + 21,194 subtests, 20 s), [node-semver](https://github.com/npm/node-semver)
+(100% coverage, 38 s), [google/uuid](https://github.com/google/uuid) (17 s) and
+[cJSON](https://github.com/DaveGamble/cJSON) (19/19, 8 s).
+
+## Command line (optional)
+
+Everything the page does is also a command, for scripts and terminals. The web
+UI itself runs each run as a `ksar run` process.
+
+```sh
+ksar run -image build/alpine.tar -- sh -c 'echo "hello from $(cat /etc/alpine-release)"; exit 3'
+# hello from 3.20.10      (exit code 3)
+
+ksar run -mem 1G -image python.tar -copy ./myproject:/work -w /work -- python3 -m pytest
+ksar run -net allow -allow pypi.org,files.pythonhosted.org -image python.tar -- pip install requests
+ksar run -mem 1536M -timeout 30m -desktop -image ubuntu.tar -- xfce4-terminal
+ksar ps                     # running VMs (from the CLI and the web UI)
+ksar stop 34af              # stop one (any unique id prefix)
+ksar suggest ./my-project   # how Ksar would run a project
+```
+
+<details>
+<summary><b>All <code>ksar run</code> flags</b></summary>
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-image FILE` | none | Root filesystem as a tar, e.g. from `docker export`. Without it, the guest has only the agent. |
+| `-mem SIZE` | `256M` | Guest RAM (e.g. `512M`, `2G`; at most 3 GiB). Writes live in RAM too. |
+| `-timeout D` | `1m` | Kill the VM after this long (`0` = never). |
+| `-i` | off | Forward stdin to the command. |
+| `-copy HOST:GUEST` | | Copy a file or directory in before running (repeatable). Symlinks are never followed. |
+| `-e KEY=VALUE` | | Set an environment variable (repeatable). |
+| `-w DIR` | `/` | Working directory in the guest. |
+| `-net MODE` | `none` | `none` (no network card), `allow` (only `-allow` hosts) or `internet`. |
+| `-allow RULE` | | With `-net allow`: `pypi.org`, `*.npmjs.org`, `github.com:443`, `1.2.3.4`, `10.1.0.0/16:8080` (repeatable or comma-separated). |
+| `-display SIZE` | none | A screen, keyboard and mouse: `on` (1280x800) or e.g. `1920x1080`, served over VNC. |
+| `-desktop` | off | Start X and XFCE (installing it once if needed), then COMMAND on the desktop. |
+| `-vnc ADDR` | `127.0.0.1:0` | Where to serve VNC: `127.0.0.1:PORT` (a password is printed) or `unix:PATH`. |
+| `-layer TAR` | | Stack a tar read-only on the image (repeatable, topmost first). |
+| `-save-changes FILE` | | If COMMAND succeeds, save what it changed as a tar, usable with `-layer`. |
+| `-id NAME` / `-label TEXT` | random | The VM's id and label in `ksar ps`. |
+| `-v` | off | Show the guest kernel log, timings and the cgroup scope. |
+| `-raw` | off | Don't filter control sequences in terminal output. |
+| `-cgroup MODE` | `auto` | Per-run limits through a systemd user scope: `auto`, `on`, `off`. |
+| `-kernel FILE` | auto | bzImage to boot. Without the Ksar kernel, a slower legacy mode works with any kernel. |
+| `-lockdown` | on | The seccomp lockdown. Disable only to debug. |
+| `-allow-root` | off | Allow running as root (not recommended). |
+
+Exit codes follow `docker run`: the command's own code, or **124** timeout,
+**125** Ksar failed, **126** not executable, **127** not found, **128+N**
+killed by signal N.
+
+</details>
+
+<details>
+<summary><b><code>ksar ui</code> flags</b></summary>
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-addr` | `127.0.0.1:8765` | Listen address (loopback only; port 0 picks a free one). |
+| `-images DIR` | `~/.local/share/ksar/images` | Image library (tars; symlinks allowed). |
+| `-history DIR` | `~/.local/share/ksar/runs` | Where finished runs are kept; `""` keeps none. |
+| `-kernel FILE` | auto | Kernel for runs. |
+| `-open` | off | Open the browser (what plain `ksar` does). |
+
+</details>
+
+<details>
+<summary><b>Image settings, VNC by hand, and other details</b></summary>
+
+- **Image settings.** `docker export` drops the image's environment and
+  working directory; Ksar reads them from an optional `NAME.tar.json` next to
+  the tar, e.g. `{"env": ["PATH=/usr/local/go/bin:/usr/bin:/bin"], "workdir": "/src"}`.
+  The web UI's Docker import writes it for you.
+- **VNC.** `-display` without `-desktop` gives a bare screen for any image with
+  Xorg; open the printed `vnc://` address in any VNC viewer.
+  `examples/desktop` builds a small Alpine desktop image.
+- **VM ids.** `ksar ps -a` also lists VMs that ended in the last hour; `-q`
+  prints ids, `-json` everything. `ksar stop` sends SIGTERM, then SIGKILL after
+  `-t` (5 s). Inside the guest, the id is in `/run/ksar/id`.
+- **Writable space** is a RAM layer of up to half the guest's memory: give more
+  `-mem` to commands that write a lot.
+- **Caches** live in `~/.cache/ksar` (image disks, desktop layers); clearing
+  them from Settings or by hand is always safe.
+
+</details>
 
 ## Development
 
 ```sh
-make test               # unit + end-to-end tests (needs KVM; uses build/bzImage
-                        # and build/alpine.tar when present)
-go test -race ./...     # race detector (lockdown probes skip: -race needs cgo)
+make test               # unit and end-to-end tests (needs KVM; uses build/bzImage and images in build/)
+go test -race ./...     # race detector (lockdown checks are skipped: -race needs cgo)
 make fuzz FUZZTIME=60s  # fuzz every parser of untrusted input
 ```
 
-The end-to-end tests run every scenario in both virtio and legacy mode, and
-inspect a running ksar from outside to check that the lockdown is in force
-on every thread.
-
-Debugging a lockdown failure: `KSAR_SECCOMP_DEBUG=1` makes blocked syscalls
-fail with errno 1000+N (N = syscall number) instead of killing ksar. Never
-use it with untrusted guests.
-
-### Layout
+The end-to-end tests boot real VMs and check from outside that the lockdown
+is in force on every thread. `KSAR_SECCOMP_DEBUG=1` turns blocked system calls
+into errors instead of kills, for debugging only.
 
 | Path | What |
 |---|---|
-| `cmd/ksar` | CLI: `run`, `ui`, `boot`, `initramfs`, `hello`; cgroup scope; terminal filtering; JSON events for the UI |
-| `cmd/ksar-agent` | Guest agent, PID 1 in the VM |
-| `internal/kvm` | Thin `/dev/kvm` wrapper; struct layouts pinned by tests |
-| `internal/boot` | x86 Linux boot protocol, long mode, CPUID |
-| `internal/vmm` | VM lifecycle, exit loop, MMIO/port dispatch, agent channels |
-| `internal/devices` | 8250 UART, CMOS clock, i8042 reset, port bus |
-| `internal/virtio` | virtio-mmio transport, virtqueues, virtio-blk, virtio-net, virtio-input, vhost-vsock |
-| `internal/display` | VNC (RFB 3.8) server over the guest framebuffer, keyboard map |
-| `internal/netproxy` | Network proxy: netstack, policy, DNS filtering, connection log |
-| `internal/agent` | Host/guest protocol and client |
-| `internal/sandbox` | One run: initramfs, boot, session, teardown |
-| `internal/image` | Docker tar to EROFS, cache |
-| `internal/initramfs` | cpio (newc) writer, tar import |
-| `internal/harden` | Lockdown: seccomp (VMM and network proxy filters), no_new_privs, non-dumpable |
-| `internal/termsafe` | Terminal control-sequence filter |
-| `internal/ui` | Web UI server (security checks, run supervisor, SSE streaming) and its embedded page |
+| `cmd/ksar` | The `ksar` command: `ui`, `run`, `ps`, `stop`, `suggest` |
+| `cmd/ksar-agent` | The guest agent, PID 1 in the VM |
+| `internal/ui` | Web UI server and page (`web/`): runs, uploads, images, history |
+| `internal/kvm`, `internal/vmm`, `internal/boot` | KVM, the VM loop, the x86 boot protocol |
+| `internal/virtio`, `internal/devices` | virtio-mmio (blk, net, input, vsock), serial, clock |
+| `internal/display` | VNC server over the guest framebuffer |
+| `internal/netproxy` | Network proxy: netstack, DNS, policy, connection log |
+| `internal/desktop` | XFCE install recipes and cached desktop layers |
+| `internal/project` | Project detection: parts, images, commands, databases |
+| `internal/llm` | Pure-Go SmolLM2 inference: tokenizer, quantized model, ranking |
+| `internal/harden` | Seccomp filters, `no_new_privs`, non-dumpable |
+| `internal/image`, `internal/initramfs` | Docker tar to EROFS, initramfs |
+| `internal/sandbox`, `internal/agent` | One run end to end; the host–guest protocol |
+| `internal/registry`, `internal/termsafe` | Running VMs for `ps`/`stop`; terminal output filter |
 | `kernel/` | Guest kernel config and build script |
-| `PLAN.md` | Design notes and stage-by-stage history |
+| `PLAN.md` | Design notes and history |
 
-## Status and roadmap
+## Roadmap
 
-Done: KVM VMM, Linux boot, guest agent, own kernel with virtio
-(blk + vsock + net + input), EROFS images, hardening, local web UI,
-optional networking (allow list or internet) and display (VNC and in the
-web UI), both off by default.
+- Multiple vCPUs per VM
+- `ksar pull` and `ksar images`: manage images without Docker
+- ioeventfd, and snapshots for even faster starts (built once and shelved, see PLAN.md)
 
-Next:
+## License
 
-- Snapshots for faster starts (built once and shelved, see PLAN.md)
-- Multiple vCPUs, image commands (`ksar pull`, `ksar images`), ioeventfd
+No license has been chosen yet, so all rights are reserved for now. If you'd
+like to use or contribute to Ksar, please open an issue.
