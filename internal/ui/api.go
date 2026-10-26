@@ -9,7 +9,13 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/net/websocket"
+	"io"
+	"ksar/internal/desktop"
 	"ksar/internal/image"
+	"ksar/internal/llm"
+	"ksar/internal/project"
+	"net"
 )
 
 // Status describes this machine for the sidebar and settings page.
@@ -37,6 +43,8 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		st := s.cfg.Status()
 		st.CacheBytes, st.CacheImages = image.CacheUsage()
+		_, layerBytes := desktop.Layers() // their disks are already in CacheUsage
+		st.CacheBytes += layerBytes
 		st.CacheDir, _ = image.CacheDir()
 		st.ImagesDir = s.cfg.ImagesDir
 		st.Addr = s.ln.Addr().String()
@@ -46,6 +54,7 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/runs", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.runs.list())
 	})
+	mux.HandleFunc("GET /api/runs/events", s.streamRuns)
 	mux.HandleFunc("POST /api/runs", func(w http.ResponseWriter, r *http.Request) {
 		var spec RunSpec
 		if !readJSON(w, r, &spec) {
@@ -93,7 +102,23 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, map[string]bool{"ok": true})
 	})
+	mux.HandleFunc("DELETE /api/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := s.runs.forget(r.PathValue("id")); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	})
+	// Clear the history: every finished run (running ones stay).
+	mux.HandleFunc("DELETE /api/runs", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := s.runs.forget("")
+		writeJSON(w, map[string]int{"deleted": n})
+	})
+	mux.HandleFunc("GET /api/history", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, s.runs.historyInfo())
+	})
 	mux.HandleFunc("GET /api/runs/{id}/events", s.streamRun)
+	mux.HandleFunc("GET /api/runs/{id}/vnc", s.vnc)
 
 	mux.HandleFunc("POST /api/uploads", func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+1<<20)
@@ -126,6 +151,80 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 		writeJSON(w, u)
 	})
 
+	// An archive (.zip, .tar, .tar.gz) is unpacked into a folder upload.
+	mux.HandleFunc("POST /api/uploads/archive", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxDirUploadBytes+1<<20)
+		f, hdr, err := r.FormFile("file")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("upload: %w", err))
+			return
+		}
+		defer f.Close()
+		if !IsArchive(hdr.Filename) {
+			writeError(w, http.StatusBadRequest, errors.New("not a .zip, .tar or .tar.gz file"))
+			return
+		}
+		u, err := s.up.addArchive(hdr.Filename, f)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, u)
+	})
+
+	// Suggests how to run an uploaded folder (see project.go).
+	mux.HandleFunc("POST /api/projects/detect", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Upload string `json:"upload"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		u, ok := s.up.get(req.Upload)
+		if !ok || !u.Dir {
+			writeError(w, http.StatusNotFound, errors.New("no such uploaded folder"))
+			return
+		}
+		writeJSON(w, s.analyze(u.path))
+	})
+
+	// The command assistant (assistant.go): status, one-time download, and
+	// ranking a project's candidate commands.
+	mux.HandleFunc("GET /api/assistant", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, s.ai.status())
+	})
+	mux.HandleFunc("POST /api/assistant/download", func(w http.ResponseWriter, r *http.Request) {
+		s.ai.download()
+		writeJSON(w, s.ai.status())
+	})
+	mux.HandleFunc("DELETE /api/assistant", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.ai.remove(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, s.ai.status())
+	})
+	mux.HandleFunc("POST /api/projects/rank", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Upload string `json:"upload"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		u, ok := s.up.get(req.Upload)
+		if !ok || !u.Dir {
+			writeError(w, http.StatusNotFound, errors.New("no such uploaded folder"))
+			return
+		}
+		start := time.Now()
+		choices, err := s.ai.rank(s.analyze(u.path))
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeJSON(w, map[string]any{"choices": choices, "model": llm.ModelName, "ms": time.Since(start).Milliseconds()})
+	})
+
 	mux.HandleFunc("GET /api/images", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.images.list())
 	})
@@ -142,6 +241,14 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, map[string]string{"name": name})
+	})
+	// Install an image's desktop ahead of its first display run.
+	mux.HandleFunc("POST /api/images/{name}/desktop", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.images.prepareDesktop(r.PathValue("name"), s.cfg); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
 	})
 	mux.HandleFunc("DELETE /api/images/{name}", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.images.remove(r.PathValue("name")); err != nil {
@@ -164,7 +271,12 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, map[string]int64{"freed": freed})
+		more, err := desktop.Clear() // desktop layers are rebuilt on the next display run
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, map[string]int64{"freed": freed + more})
 	})
 
 	mux.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
@@ -181,6 +293,91 @@ func (s *Server) apiRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, v)
 	})
+}
+
+// vnc bridges a WebSocket to the run's VNC socket, so the page can show
+// the guest's screen. The browser speaks RFB itself; this only moves
+// bytes. A WebSocket upgrade is a GET, which the middleware lets through
+// without an Origin check, so it is checked here: cookies aren't
+// isolated by port, and a page on another local port must not be able to
+// open the screen with the user's session.
+func (s *Server) vnc(w http.ResponseWriter, r *http.Request) {
+	run, ok := s.runs.get(r.PathValue("id"))
+	if !ok || run.vncSock == "" {
+		writeError(w, http.StatusNotFound, errors.New("this run has no display"))
+		return
+	}
+	if run.finished() {
+		writeError(w, http.StatusGone, errors.New("the run has ended"))
+		return
+	}
+	srv := websocket.Server{
+		Handshake: func(c *websocket.Config, req *http.Request) error {
+			if req.Header.Get("Origin") != s.origin {
+				return errors.New("cross-origin request refused")
+			}
+			return nil
+		},
+		Handler: func(ws *websocket.Conn) {
+			defer ws.Close()
+			ws.PayloadType = websocket.BinaryFrame
+			conn, err := net.DialTimeout("unix", run.vncSock, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			go func() {
+				io.Copy(conn, ws)
+				conn.Close()
+			}()
+			io.Copy(ws, conn)
+		},
+	}
+	srv.ServeHTTP(w, r)
+}
+
+// streamRuns pushes the run list as Server-Sent Events: once on connect,
+// then whenever it changes, at most a few times a second. Nothing is sent
+// while no run changes, so an idle page costs nothing.
+func (s *Server) streamRuns(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Accel-Buffering", "no")
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		changed := s.runs.changes() // before the snapshot, so no change is missed
+		b, _ := json.Marshal(s.runs.list())
+		if _, err := fmt.Fprintf(w, "event: runs\ndata: %s\n\n", b); err != nil {
+			return
+		}
+		flusher.Flush()
+	wait:
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-heartbeat.C:
+				if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-changed:
+				break wait
+			}
+		}
+		select { // coalesce bursts of changes
+		case <-r.Context().Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // streamRun sends a run's output as Server-Sent Events. Each output chunk
@@ -299,4 +496,21 @@ func writeError(w http.ResponseWriter, code int, err error) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+// analyze is project.Analyze with each option's image resolved to the
+// library's copy, when it has been imported already.
+func (s *Server) analyze(dir string) project.Plan {
+	plan := project.Analyze(dir)
+	have := func(ref string) string {
+		if _, ok := s.images.path(project.LibraryName(ref)); ok {
+			return project.LibraryName(ref)
+		}
+		return ""
+	}
+	plan.Image = have(plan.Docker)
+	for i := range plan.Options {
+		plan.Options[i].Image = have(plan.Options[i].Docker)
+	}
+	return plan
 }

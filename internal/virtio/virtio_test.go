@@ -72,11 +72,11 @@ func (d *fakeDriver) publish(head uint16) {
 	slot := d.aidx % d.cfg.Size
 	binary.LittleEndian.PutUint16(d.ram[d.cfg.Avail+4+2*uint64(slot):], head)
 	d.aidx++
-	binary.LittleEndian.PutUint16(d.ram[d.cfg.Avail+2:], d.aidx)
+	storeU16(d.ram[d.cfg.Avail+2:], d.aidx) // as the device reads it: atomically
 }
 
 func (d *fakeDriver) usedIdx() uint16 {
-	return binary.LittleEndian.Uint16(d.ram[d.cfg.Used+2:])
+	return loadU16(d.ram[d.cfg.Used+2:])
 }
 
 func (d *fakeDriver) usedLen(slot uint16) uint32 {

@@ -45,6 +45,14 @@ func CheckUser(allowRoot bool) error {
 // affects every thread. Call it after all files, devices and sockets the
 // VM needs are open, and before guest code runs.
 func Lockdown() error {
+	if err := basic(); err != nil {
+		return err
+	}
+	return installSeccomp(vmmFilter())
+}
+
+// basic applies the restrictions that need no allowlist.
+func basic() error {
 	if err := setrlimit(syscall.RLIMIT_CORE, 0); err != nil {
 		return fmt.Errorf("disable core dumps: %w", err)
 	}
@@ -54,7 +62,7 @@ func Lockdown() error {
 	if err := prctl(prSetNoNewPrivs, 1); err != nil {
 		return fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", err)
 	}
-	return installSeccomp(vmmFilter())
+	return nil
 }
 
 func prctl(option, arg uintptr) error {

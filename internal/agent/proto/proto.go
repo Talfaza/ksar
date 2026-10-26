@@ -33,12 +33,13 @@ const Version = 1
 // Message types.
 const (
 	// Guest -> host.
-	TypeReady  = 0x01 // JSON Ready: agent is up
-	TypeCredit = 0x02 // uint32: host may send this many more bytes
-	TypeResult = 0x03 // JSON Result: outcome of a file transfer
-	TypeStdout = 0x20 // raw bytes
-	TypeStderr = 0x21 // raw bytes
-	TypeExit   = 0x22 // JSON Exit: command finished
+	TypeReady      = 0x01 // JSON Ready: agent is up
+	TypeCredit     = 0x02 // uint32: host may send this many more bytes
+	TypeResult     = 0x03 // JSON Result: outcome of a file transfer
+	TypeStdout     = 0x20 // raw bytes
+	TypeStderr     = 0x21 // raw bytes
+	TypeExit       = 0x22 // JSON Exit: command finished
+	TypeExportData = 0x23 // raw bytes of an exported tar stream; then a Result
 
 	// Host -> guest.
 	TypeFileOpen   = 0x10 // JSON FileOpen: start writing a file
@@ -50,6 +51,8 @@ const (
 	TypeTarOpen    = 0x16 // JSON TarOpen: start extracting a tar stream into a directory
 	TypeTarData    = 0x17 // raw bytes of the tar stream
 	TypeTarClose   = 0x18 // end of stream; guest replies with Result
+	TypeExport     = 0x19 // JSON Export: send everything the guest changed as a tar
+	TypeHello      = 0x1a // JSON Hello: the run's id and fresh entropy; sent first
 )
 
 const (
@@ -72,6 +75,9 @@ const (
 type Ready struct {
 	Version int    `json:"version"`
 	Kernel  string `json:"kernel"`
+	// Notes are things the user should know about this guest, e.g. that
+	// the run has a display but the image has no X server.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // FileOpen starts a file transfer into the guest.
@@ -81,6 +87,22 @@ type FileOpen struct {
 }
 
 // Result reports the outcome of a file transfer.
+// Hello is the host's first message: the VM's id, and fresh entropy for
+// the guest's random number generator, mixed in (and reseeded from)
+// before anything runs.
+type Hello struct {
+	ID      string `json:"id,omitempty"`
+	Entropy []byte `json:"entropy"`
+}
+
+// Export asks for the guest's changes to its root filesystem (the
+// overlay's writable layer) as a tar stream: added and modified files,
+// plus overlayfs whiteouts for deleted ones. Paths under Exclude
+// (relative, e.g. "tmp") are left out.
+type Export struct {
+	Exclude []string `json:"exclude,omitempty"`
+}
+
 type Result struct {
 	Error string `json:"error,omitempty"`
 	Files int    `json:"files,omitempty"` // entries written, for directory copies

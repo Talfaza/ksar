@@ -93,16 +93,21 @@ var allowed = map[string]uint32{
 	// Go's network poller (os.File on non-blocking fds, eventfd relays).
 	"epoll_wait": 232, "epoll_ctl": 233, "epoll_pwait": 281,
 	"epoll_create1": 291, "eventfd2": 290,
-	// The agent connection: accept on the listening vsock socket.
-	"accept4": 288, "select": 23, "pselect6": 270,
+	// The agent connection and VNC viewers: accept on sockets that were
+	// listening before lockdown (Go reads the local address after accept).
+	"accept4": 288, "select": 23, "pselect6": 270, "getsockname": 51,
 }
 
 const (
-	nrMmap     = 9
-	nrMprotect = 10
-	nrIoctl    = 16
-	nrClone    = 56
-	nrClone3   = 435
+	nrMmap       = 9
+	nrMprotect   = 10
+	nrIoctl      = 16
+	nrClone      = 56
+	nrClone3     = 435
+	nrSetsockopt = 54
+
+	ipprotoTCP = 6
+	tcpNoDelay = 1
 
 	protExec    = 0x4
 	cloneThread = 0x10000
@@ -120,6 +125,39 @@ var allowedIoctls = []uint32{
 const vhostIoctlType = 0xAF00
 
 func vmmFilter() program {
+	return buildFilter(allowed, func(p *program) {
+		// setsockopt: only TCP_NODELAY, which Go sets on every accepted
+		// TCP connection (a VNC viewer on loopback).
+		p.cond(nrSetsockopt, func(b *program) {
+			b.ld(argLow(1))
+			b.jeq(ipprotoTCP, 0, 3)
+			b.ld(argLow(2))
+			b.jeq(tcpNoDelay, 0, 1)
+			b.ret(retAllow)
+			b.ret(retTrap)
+		})
+		// ioctl: listed KVM requests and vhost.
+		p.cond(nrIoctl, func(b *program) {
+			b.ld(argHigh(1))
+			b.jeq(0, 1, 0)
+			b.ret(retTrap)
+			b.ld(argLow(1))
+			for _, req := range allowedIoctls {
+				b.jeq(req, 0, 1)
+				b.ret(retAllow)
+			}
+			b.and(0xff00)
+			b.jeq(vhostIoctlType, 0, 1)
+			b.ret(retAllow)
+			b.ret(retTrap)
+		})
+	})
+}
+
+// buildFilter emits the common frame of a filter: the architecture check,
+// the plain allowlist, the clone/clone3/mmap/mprotect argument checks,
+// then extra's checks, and SIGSYS for everything else.
+func buildFilter(allow map[string]uint32, extra func(p *program)) program {
 	var p program
 	// Only native x86_64 syscalls; the x32 ABI is another way in.
 	p.ld(offArch)
@@ -129,7 +167,7 @@ func vmmFilter() program {
 	p.jge(x32SyscallBit, 0, 1)
 	p.ret(retKill)
 
-	for _, nr := range sortedAllowed() {
+	for _, nr := range sortedNrs(allow) {
 		p.jeq(nr, 0, 1)
 		p.ret(retAllow)
 	}
@@ -157,21 +195,7 @@ func vmmFilter() program {
 		})
 	}
 
-	// ioctl: listed KVM requests and vhost.
-	p.cond(nrIoctl, func(b *program) {
-		b.ld(argHigh(1))
-		b.jeq(0, 1, 0)
-		b.ret(retTrap)
-		b.ld(argLow(1))
-		for _, req := range allowedIoctls {
-			b.jeq(req, 0, 1)
-			b.ret(retAllow)
-		}
-		b.and(0xff00)
-		b.jeq(vhostIoctlType, 0, 1)
-		b.ret(retAllow)
-		b.ret(retTrap)
-	})
+	extra(&p)
 
 	if os.Getenv("KSAR_SECCOMP_DEBUG") != "" {
 		// Diagnostic mode: instead of killing, make a blocked syscall
@@ -188,11 +212,11 @@ func vmmFilter() program {
 
 func syscallErrno(e uint32) uint32 { return 0x00050000 | e } // SECCOMP_RET_ERRNO
 
-// sortedAllowed returns allowlist numbers in a fixed order, so the
-// generated program is deterministic.
-func sortedAllowed() []uint32 {
-	nrs := make([]uint32, 0, len(allowed))
-	for _, nr := range allowed {
+// sortedNrs returns allowlist numbers in a fixed order, so the generated
+// program is deterministic.
+func sortedNrs(allow map[string]uint32) []uint32 {
+	nrs := make([]uint32, 0, len(allow))
+	for _, nr := range allow {
 		nrs = append(nrs, nr)
 	}
 	for i := 1; i < len(nrs); i++ {

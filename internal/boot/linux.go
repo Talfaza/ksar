@@ -63,7 +63,36 @@ type Linux struct {
 	Kernel  []byte // bzImage
 	Initrd  []byte // optional initramfs (cpio, optionally compressed)
 	Cmdline string
+
+	// Framebuffer, if set, is announced to the kernel as a firmware
+	// linear framebuffer (32-bit xRGB), which simpledrm then drives.
+	Framebuffer *Framebuffer
 }
+
+// Framebuffer is a linear framebuffer at a guest physical address outside
+// RAM, with 4 bytes per pixel: blue, green, red, unused.
+type Framebuffer struct {
+	Base          uint64
+	Width, Height int
+	Stride        int // bytes per line
+}
+
+// screen_info (offset 0 of boot_params) fields for a VESA linear framebuffer.
+const (
+	siIsVGA        = 0x0f
+	siLfbWidth     = 0x12
+	siLfbHeight    = 0x14
+	siLfbDepth     = 0x16
+	siLfbBase      = 0x18
+	siLfbSize      = 0x1c // in 64 KiB units for VLFB
+	siLfbLineLen   = 0x24
+	siRedSize      = 0x26 // then red_pos, green size/pos, blue, rsvd
+	siCapabilities = 0x36
+	siExtLfbBase   = 0x3a
+	videoTypeVLFB  = 0x23
+	video64BitBase = 1 << 1
+	e820Reserved   = 2
+)
 
 // Load copies the kernel, initrd and command line into mem (guest RAM
 // starting at physical address 0) and builds boot_params. It returns the
@@ -165,9 +194,44 @@ func Load(mem []byte, l Linux) (entry uint64, err error) {
 	}
 	zp[bpE820Entries] = byte(len(e820))
 
+	if fb := l.Framebuffer; fb != nil {
+		if err := writeScreenInfo(zp, fb, memSize); err != nil {
+			return 0, err
+		}
+		// Mark the framebuffer reserved so nothing treats it as RAM.
+		off := bpE820Table + len(e820)*20
+		size := uint64(fb.Stride * fb.Height)
+		binary.LittleEndian.PutUint64(zp[off:], fb.Base)
+		binary.LittleEndian.PutUint64(zp[off+8:], (size+0xffff)&^0xffff)
+		binary.LittleEndian.PutUint32(zp[off+16:], e820Reserved)
+		zp[bpE820Entries]++
+	}
+
 	writePageTables(mem)
 	writeGDT(mem)
 	return KernelAddr + entry64Offset, nil
+}
+
+func writeScreenInfo(zp []byte, fb *Framebuffer, memSize uint64) error {
+	size := uint64(fb.Stride) * uint64(fb.Height)
+	if fb.Width <= 0 || fb.Height <= 0 || fb.Width > 0xffff || fb.Height > 0xffff ||
+		fb.Stride < fb.Width*4 || fb.Stride > 0xffff || fb.Base%4096 != 0 || fb.Base < memSize {
+		return fmt.Errorf("invalid framebuffer %dx%d stride %d at %#x", fb.Width, fb.Height, fb.Stride, fb.Base)
+	}
+	le := binary.LittleEndian
+	zp[siIsVGA] = videoTypeVLFB
+	le.PutUint16(zp[siLfbWidth:], uint16(fb.Width))
+	le.PutUint16(zp[siLfbHeight:], uint16(fb.Height))
+	le.PutUint16(zp[siLfbDepth:], 32)
+	le.PutUint32(zp[siLfbBase:], uint32(fb.Base))
+	le.PutUint32(zp[siLfbSize:], uint32((size+0xffff)>>16))
+	le.PutUint16(zp[siLfbLineLen:], uint16(fb.Stride))
+	copy(zp[siRedSize:], []byte{8, 16, 8, 8, 8, 0, 8, 24}) // xRGB8888
+	if fb.Base>>32 != 0 {
+		le.PutUint32(zp[siCapabilities:], video64BitBase)
+		le.PutUint32(zp[siExtLfbBase:], uint32(fb.Base>>32))
+	}
+	return nil
 }
 
 // writePageTables identity-maps the first 4 GiB with 2 MiB pages, which

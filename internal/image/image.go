@@ -82,6 +82,20 @@ func FromTar(tarPath string) (string, error) {
 	return out, nil
 }
 
+// Key identifies a tar's current contents (path, size and mtime), for
+// caching things derived from it.
+func Key(tarPath string) (string, error) {
+	abs, err := filepath.Abs(tarPath)
+	if err != nil {
+		return "", err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	return cacheKey(abs, st), nil
+}
+
 func cacheKey(abs string, st os.FileInfo) string {
 	h := sha256.Sum256([]byte(abs + "\x00" + strconv.FormatInt(st.Size(), 10) + "\x00" +
 		strconv.FormatInt(st.ModTime().UnixNano(), 10)))

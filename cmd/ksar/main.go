@@ -20,8 +20,14 @@ import (
 const usage = `ksar - run untrusted code in KVM microVMs
 
 Usage:
+  ksar                               open the web interface in your browser
+  ksar ui [flags]                    serve the web interface (localhost only)
+
+Optional command line:
   ksar run [flags] -- CMD [ARGS...]  run a command in a throwaway microVM
-  ksar ui [flags]                    open the web interface (localhost only)
+  ksar ps [-a] [-q] [-json]          list running VMs
+  ksar stop ID...                    stop VMs (an id prefix is enough)
+  ksar suggest DIR                   suggest how to run a project (built-in tiny model)
   ksar boot [flags]                  boot a Linux kernel in a microVM (stage 2)
   ksar initramfs -init FILE -o OUT   build a minimal initramfs around an init binary
   ksar hello [-timeout 5s] [-spin]   run a tiny real-mode guest (stage 1)
@@ -31,9 +37,10 @@ Run "ksar <command> -h" for a command's flags.
 `
 
 func main() {
+	// Ksar is used from the browser: with no command, serve the web
+	// interface and open it.
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		os.Exit(cmdUI([]string{"-open"}))
 	}
 	var err error
 	switch os.Args[1] {
@@ -41,6 +48,14 @@ func main() {
 		os.Exit(cmdRun(os.Args[2:]))
 	case "ui":
 		os.Exit(cmdUI(os.Args[2:]))
+	case "ps":
+		os.Exit(cmdPs(os.Args[2:]))
+	case "stop":
+		os.Exit(cmdStop(os.Args[2:]))
+	case "suggest":
+		os.Exit(cmdSuggest(os.Args[2:]))
+	case "net-proxy":
+		os.Exit(cmdNetProxy(os.Args[2:]))
 	case "boot":
 		err = cmdBoot(os.Args[2:])
 	case "initramfs":

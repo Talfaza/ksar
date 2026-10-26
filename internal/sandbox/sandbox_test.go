@@ -1,8 +1,10 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -317,6 +319,67 @@ func TestCopyDirectory(t *testing.T) {
 		}
 		if strings.Contains(stdout, "TOP SECRET") {
 			t.Fatal("a host file leaked into the guest through a symlink")
+		}
+	})
+}
+
+// SaveChanges exports exactly what a run changed, and the result stacks
+// on the same image as a layer: added files, a symlink and a deletion
+// (an overlayfs whiteout) all carry over; scratch space does not.
+func TestSaveChangesAsLayer(t *testing.T) {
+	each(t, func(t *testing.T, m mode) {
+		if !m.virtio {
+			t.Skip("layers need virtio mode")
+		}
+		var opts Options
+		withAlpine(t, m, &opts)
+		var saved bytes.Buffer
+		var sr SaveResult
+		opts.SaveChanges, opts.SaveResult = &saved, &sr
+		opts.Exec = proto.Exec{Args: []string{"sh", "-c",
+			"mkdir -p /opt/x && echo hello > /opt/x/f && ln -s f /opt/x/l && rm /etc/motd && echo junk > /tmp/junk"}}
+		res, _, stderr := run(t, m, opts)
+		if res.Exit.Code != 0 || !sr.Saved {
+			t.Fatalf("exit %d, saved %+v, stderr %q", res.Exit.Code, sr, stderr)
+		}
+		names := map[string]*tar.Header{}
+		tr := tar.NewReader(bytes.NewReader(saved.Bytes()))
+		for {
+			h, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			names[h.Name] = h
+		}
+		if h := names["etc/motd"]; h == nil || h.Typeflag != tar.TypeChar || h.Devmajor != 0 || h.Devminor != 0 {
+			t.Errorf("deleted /etc/motd is not a whiteout: %+v", h)
+		}
+		if names["opt/x/f"] == nil || names["opt/x/l"] == nil || names["opt/x/l"].Linkname != "f" {
+			t.Errorf("added files missing: %v", names)
+		}
+		if names["tmp/junk"] != nil {
+			t.Errorf("scratch space was exported")
+		}
+
+		layerTar := filepath.Join(t.TempDir(), "layer.tar")
+		if err := os.WriteFile(layerTar, saved.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		layer, err := image.FromTar(layerTar)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var opts2 Options
+		withAlpine(t, m, &opts2)
+		opts2.Layers = []string{layer}
+		opts2.Exec = proto.Exec{Args: []string{"sh", "-c",
+			"cat /opt/x/f; readlink /opt/x/l; [ -e /etc/motd ] && echo motd-back || echo motd-gone; ls /etc/alpine-release"}}
+		_, out, stderr := run(t, m, opts2)
+		if out != "hello\nf\nmotd-gone\n/etc/alpine-release\n" {
+			t.Errorf("with the layer: %q (stderr %q)", out, stderr)
 		}
 	})
 }

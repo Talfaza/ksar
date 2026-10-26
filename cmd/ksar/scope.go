@@ -30,7 +30,7 @@ type cgroupLimits struct {
 //
 // mode is "auto" (use systemd if reachable, otherwise continue without),
 // "on" (fail if it isn't), or "off".
-func enterScope(mode string, limits cgroupLimits, verbose bool) error {
+func enterScope(mode string, limits cgroupLimits, verbose bool, id string) error {
 	if mode == "off" || os.Getenv(scopeEnv) != "" {
 		return nil
 	}
@@ -54,9 +54,11 @@ func enterScope(mode string, limits cgroupLimits, verbose bool) error {
 	if err != nil {
 		return err
 	}
-	var id [4]byte
-	rand.Read(id[:])
-	unit := fmt.Sprintf("ksar-%d-%s.scope", os.Getpid(), hex.EncodeToString(id[:]))
+	// Named after the VM, so systemctl --user and ksar ps agree. A random
+	// suffix keeps a reused id (-id) from clashing with a lingering unit.
+	var sfx [2]byte
+	rand.Read(sfx[:])
+	unit := fmt.Sprintf("ksar-%s-%s.scope", id, hex.EncodeToString(sfx[:]))
 
 	args := []string{run, "--user", "--scope", "--quiet", "--collect", "--unit=" + unit,
 		fmt.Sprintf("--property=MemoryMax=%d", limits.MemoryMax),
@@ -64,7 +66,9 @@ func enterScope(mode string, limits cgroupLimits, verbose bool) error {
 		fmt.Sprintf("--property=TasksMax=%d", limits.TasksMax),
 		fmt.Sprintf("--property=CPUQuota=%d%%", limits.CPUQuota),
 		"--", self}
-	args = append(args, os.Args[1:]...)
+	// Same command line, with the id fixed so the new process keeps it.
+	args = append(args, os.Args[1], "-id", id)
+	args = append(args, os.Args[2:]...)
 	env := append(os.Environ(), scopeEnv+"="+unit)
 	// Replace this process: exit status, signals and stdio pass straight
 	// through, and there is no extra parent process.

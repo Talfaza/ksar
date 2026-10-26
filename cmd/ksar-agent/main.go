@@ -6,6 +6,9 @@
 //
 //	ksar.root=/dev/vda   mount this read-only image (EROFS) under a RAM
 //	                     overlay and switch into it
+//	ksar.layers=/dev/vdb,/dev/vdc
+//	                     extra read-only layers stacked on the image,
+//	                     topmost first (e.g. an installed desktop)
 //	ksar.vsock=PORT      talk to the host over vsock (CID 2, PORT); without
 //	                     it, fall back to the serial port /dev/ttyS1
 //
@@ -59,11 +62,18 @@ func main() {
 	}
 	args := kernelArgs()
 	if root := args["ksar.root"]; root != "" {
-		if err := switchRoot(root, args["ksar.rootfstype"]); err != nil {
+		var layers []string
+		if l := args["ksar.layers"]; l != "" {
+			layers = strings.Split(l, ",")
+		}
+		if err := switchRoot(root, args["ksar.rootfstype"], layers); err != nil {
 			fatal("switch to root %s: %v", root, err)
 		}
 	}
 	setupSystem()
+	if args["ksar.display"] == "1" {
+		setupDisplay()
+	}
 
 	conn, err := openChannel(args)
 	if err != nil {
@@ -95,7 +105,11 @@ func kernelArgs() map[string]string {
 // switchRoot mounts the image read-only, stacks a RAM-backed writable
 // layer on it with overlayfs, and makes that the root. Writes never reach
 // the image, so one image file serves many runs, each starting clean.
-func switchRoot(dev, fstype string) error {
+// upper is the overlay's writable layer, opened before the root switch
+// hides it: Export reads the guest's changes from it.
+var upper *os.Root
+
+func switchRoot(dev, fstype string, layers []string) error {
 	if fstype == "" {
 		fstype = "erofs"
 	}
@@ -112,7 +126,20 @@ func switchRoot(dev, fstype string) error {
 	if err := syscall.Mount(dev, "/.ksar/lower", fstype, syscall.MS_RDONLY, ""); err != nil {
 		return fmt.Errorf("mount %s (%s): %w", dev, fstype, err)
 	}
-	if err := syscall.Mount("tmpfs", "/.ksar/rw", "tmpfs", 0, "mode=0755"); err != nil {
+	lowers := []string{"/.ksar/lower"}
+	for i := len(layers) - 1; i >= 0; i-- { // the last listed is just above the image
+		d := fmt.Sprintf("/.ksar/layer%d", i)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+		if err := syscall.Mount(layers[i], d, fstype, syscall.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("mount layer %s: %w", layers[i], err)
+		}
+		lowers = append([]string{d}, lowers...)
+	}
+	// Writes live in RAM; allow most of it (tmpfs defaults to half), so
+	// installing software in the guest isn't cut short.
+	if err := syscall.Mount("tmpfs", "/.ksar/rw", "tmpfs", 0, "mode=0755,size=85%"); err != nil {
 		return fmt.Errorf("mount writable layer: %w", err)
 	}
 	for _, d := range []string{"/.ksar/rw/upper", "/.ksar/rw/work"} {
@@ -121,8 +148,12 @@ func switchRoot(dev, fstype string) error {
 		}
 	}
 	if err := syscall.Mount("overlay", "/.ksar/root", "overlay", 0,
-		"lowerdir=/.ksar/lower,upperdir=/.ksar/rw/upper,workdir=/.ksar/rw/work"); err != nil {
+		"lowerdir="+strings.Join(lowers, ":")+",upperdir=/.ksar/rw/upper,workdir=/.ksar/rw/work"); err != nil {
 		return fmt.Errorf("mount overlay: %w", err)
+	}
+	var err error
+	if upper, err = os.OpenRoot("/.ksar/rw/upper"); err != nil {
+		return err
 	}
 	// Detach the initramfs's /proc and /dev; setupSystem mounts fresh ones
 	// inside the new root.
@@ -211,6 +242,141 @@ func setupSystem() {
 	if err := loopbackUp(); err != nil {
 		logf("loopback: %v", err)
 	}
+	setupHosts()
+	setupDNS()
+}
+
+// setupHosts makes localhost and the guest's own name resolve locally.
+// Images exported from Docker have an empty /etc/hosts (Docker fills it
+// in when a container starts), and without these lines a lookup of
+// localhost goes to the network, which a run without one doesn't have.
+func setupHosts() {
+	old, _ := os.ReadFile("/etc/hosts")
+	if bytes.Contains(old, []byte("localhost")) {
+		return
+	}
+	os.MkdirAll("/etc", 0o755)
+	os.Remove("/etc/hosts") // may be a symlink
+	if err := os.WriteFile("/etc/hosts", append([]byte("127.0.0.1\tlocalhost ksar\n::1\tlocalhost ip6-localhost\n"), old...), 0o644); err != nil {
+		logf("hosts: %v", err)
+	}
+}
+
+// setupDisplay prepares for X on the run's screen. The guest has no udev,
+// so Xorg can't discover the virtio keyboard and tablet by itself: an
+// xorg.conf.d snippet names their event devices. Programs default to
+// DISPLAY=:0.
+// notes are reported to the host in the Ready message.
+var notes []string
+
+func setupDisplay() {
+	defaultEnv = append(defaultEnv, "DISPLAY=:0")
+	events := map[string]string{} // device name -> /dev/input/eventN
+	paths, _ := filepath.Glob("/sys/class/input/event*/device/name")
+	for _, p := range paths {
+		name, err := os.ReadFile(p)
+		if err == nil {
+			events[strings.TrimSpace(string(name))] = "/dev/input/" + filepath.Base(filepath.Dir(filepath.Dir(p)))
+		}
+	}
+	kbd, tablet := events["Ksar Keyboard"], events["Ksar Tablet"]
+	if kbd == "" || tablet == "" {
+		logf("display: input devices not found")
+		return
+	}
+	// libinput only accepts devices udev has initialized, and the guest
+	// has no udev: write the database entries udev would have.
+	udevInput(kbd, "E:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\n")
+	udevInput(tablet, "E:ID_INPUT_MOUSE=1\n")
+	input := xorgModule("input", "evdev", "libinput")
+	video := xorgModule("drivers", "modesetting", "fbdev")
+	if input == "" && video == "" {
+		notes = append(notes, "this image has no X server (Xorg), so nothing can draw on the display; "+
+			"use an image with a desktop, e.g. examples/desktop")
+		return
+	}
+	if input == "" || video == "" {
+		notes = append(notes, "this image has Xorg but lacks an input driver (xf86-input-evdev or -libinput) "+
+			"or a video driver (modesetting or fbdev), so X can't use the display")
+		return
+	}
+	devOpt := `Option "kmsdev" "/dev/dri/card0"`
+	if video == "fbdev" {
+		devOpt = `Option "fbdev" "/dev/fb0"`
+	}
+	conf := fmt.Sprintf(`# Written by ksar-agent for this run's virtual screen.
+Section "ServerFlags"
+	Option "AutoAddDevices" "false"
+	Option "AutoEnableDevices" "false"
+EndSection
+Section "Device"
+	Identifier "ksar-screen"
+	Driver "%s"
+	%s
+EndSection
+Section "InputDevice"
+	Identifier "ksar-keyboard"
+	Driver "%s"
+	Option "Device" "%s"
+EndSection
+Section "InputDevice"
+	Identifier "ksar-tablet"
+	Driver "%s"
+	Option "Device" "%s"
+EndSection
+Section "ServerLayout"
+	Identifier "ksar"
+	Screen "ksar-screen-0"
+	InputDevice "ksar-keyboard" "CoreKeyboard"
+	InputDevice "ksar-tablet" "CorePointer"
+EndSection
+Section "Screen"
+	Identifier "ksar-screen-0"
+	Device "ksar-screen"
+EndSection
+`, video, devOpt, input, kbd, input, tablet)
+	os.MkdirAll("/etc/X11/xorg.conf.d", 0o755)
+	if err := os.WriteFile("/etc/X11/xorg.conf.d/10-ksar.conf", []byte(conf), 0o644); err != nil {
+		logf("display: %v", err)
+	}
+}
+
+// udevInput writes /run/udev/data/cMAJ:MIN for an input event device.
+func udevInput(dev, props string) {
+	b, err := os.ReadFile("/sys/class/input/" + filepath.Base(dev) + "/dev")
+	if err != nil {
+		return
+	}
+	os.MkdirAll("/run/udev/data", 0o755)
+	data := fmt.Sprintf("I:%d\nE:ID_INPUT=1\n%sG:seat\nQ:seat\n", time.Now().UnixMicro(), props)
+	os.WriteFile("/run/udev/data/c"+strings.TrimSpace(string(b)), []byte(data), 0o644)
+}
+
+// xorgModule returns the first of the named Xorg driver modules installed.
+func xorgModule(kind string, names ...string) string {
+	for _, n := range names {
+		for _, dir := range []string{"/usr/lib/xorg/modules", "/usr/lib64/xorg/modules", "/usr/lib/x86_64-linux-gnu/xorg/modules"} {
+			if _, err := os.Stat(filepath.Join(dir, kind, n+"_drv.so")); err == nil {
+				return n
+			}
+		}
+	}
+	return ""
+}
+
+// setupDNS points the resolver at Ksar's network proxy when the run has a
+// network: the kernel configured eth0 from the ip= parameter and lists the
+// DNS server in /proc/net/pnp, which is already in resolv.conf format.
+func setupDNS() {
+	pnp, err := os.ReadFile("/proc/net/pnp")
+	if err != nil || !bytes.Contains(pnp, []byte("nameserver")) {
+		return // no network for this run
+	}
+	os.MkdirAll("/etc", 0o755)
+	os.Remove("/etc/resolv.conf") // often a symlink into /run in images
+	if err := os.WriteFile("/etc/resolv.conf", pnp, 0o644); err != nil {
+		logf("resolv.conf: %v", err)
+	}
 }
 
 type agent struct {
@@ -230,7 +396,7 @@ func (a *agent) serve() error {
 	var u syscall.Utsname
 	syscall.Uname(&u)
 	if err := a.out.WriteJSON(proto.TypeReady, proto.Ready{
-		Version: proto.Version, Kernel: cstr(u.Release[:]),
+		Version: proto.Version, Kernel: cstr(u.Release[:]), Notes: notes,
 	}); err != nil {
 		return err
 	}
@@ -306,6 +472,18 @@ func (a *agent) handle(f proto.Frame) error {
 			// only after, so the host never runs ahead of the disk.
 			a.tarW.Write(f.Payload)
 		}
+	case proto.TypeHello:
+		var m proto.Hello
+		if err := proto.Decode(f, &m); err != nil {
+			return err
+		}
+		hello(m)
+	case proto.TypeExport:
+		var m proto.Export
+		if err := proto.Decode(f, &m); err != nil {
+			return err
+		}
+		return a.export(m)
 	case proto.TypeTarClose:
 		res := proto.Result{Error: "no directory copy in progress"}
 		if a.tarW != nil {

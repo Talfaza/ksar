@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +19,9 @@ import (
 	"syscall"
 	"time"
 
+	"ksar/internal/netproxy"
 	"ksar/internal/termsafe"
+	"ksar/internal/vmm"
 )
 
 // Limits on what a run request may ask for.
@@ -43,6 +46,50 @@ type RunSpec struct {
 	Workdir     string     `json:"workdir"`
 	Files       []FileSpec `json:"files"`
 	Interactive bool       `json:"interactive"`
+	Display     string     `json:"display"`         // "" (none) or WIDTHxHEIGHT
+	Net         string     `json:"net"`             // none (or ""), allow, internet
+	Allow       []string   `json:"allow"`           // hosts for Net "allow" (and openings for "internet")
+	Label       string     `json:"label,omitempty"` // what the page calls the run instead of the command (display only)
+}
+
+const maxAllow = 64
+
+// validDisplay checks a screen size the way ksar run will.
+func validDisplay(s string) error {
+	if s == "" {
+		return nil
+	}
+	var w, h int
+	if n, err := fmt.Sscanf(s, "%dx%d", &w, &h); n != 2 || err != nil || fmt.Sprintf("%dx%d", w, h) != s {
+		return fmt.Errorf("display %q: want WIDTHxHEIGHT", s)
+	}
+	if w < 320 || h < 200 || w > vmm.MaxDisplayWidth || h > vmm.MaxDisplayHeight || w%8 != 0 {
+		return fmt.Errorf("display %q: must be between 320x200 and %dx%d", s, vmm.MaxDisplayWidth, vmm.MaxDisplayHeight)
+	}
+	return nil
+}
+
+// validNet checks a network policy the way ksar run will.
+func validNet(mode string, allow []string) error {
+	if len(allow) > maxAllow {
+		return fmt.Errorf("at most %d allowed hosts", maxAllow)
+	}
+	switch mode {
+	case "", netproxy.ModeNone:
+		return nil // the allow list is kept, but unused
+	case netproxy.ModeAllow, netproxy.ModeInternet:
+	default:
+		return fmt.Errorf("network must be none, allow or internet, not %q", mode)
+	}
+	for _, a := range allow {
+		if _, err := netproxy.ParseRule(a); err != nil {
+			return err
+		}
+	}
+	if mode == netproxy.ModeAllow && len(allow) == 0 {
+		return errors.New("add at least one allowed host, or turn the network off")
+	}
+	return nil
 }
 
 // FileSpec copies an uploaded file into the guest.
@@ -53,15 +100,23 @@ type FileSpec struct {
 }
 
 func (s *RunSpec) validate(lib *imageLibrary, up *uploadStore) ([]string, error) {
-	if strings.TrimSpace(s.Command) == "" {
-		return nil, errors.New("command is empty")
-	}
 	if len(s.Command) > maxCommandLen || strings.ContainsRune(s.Command, 0) {
 		return nil, errors.New("command is too long or contains a NUL byte")
 	}
-	args, err := splitCommand(s.Command)
-	if err != nil {
-		return nil, err
+	if len(s.Label) > 300 || strings.ContainsAny(s.Label, "\x00\n\r") {
+		return nil, errors.New("label is too long or has control characters")
+	}
+	var args []string
+	if strings.TrimSpace(s.Command) == "" {
+		if s.Display == "" {
+			return nil, errors.New("command is empty")
+		}
+		// A display run with no command is the desktop itself.
+	} else {
+		var err error
+		if args, err = splitCommand(s.Command); err != nil {
+			return nil, err
+		}
 	}
 	if s.MemMB < minMemMB || s.MemMB > maxMemMB {
 		return nil, fmt.Errorf("memory must be between %d and %d MB", minMemMB, maxMemMB)
@@ -92,6 +147,19 @@ func (s *RunSpec) validate(lib *imageLibrary, up *uploadStore) ([]string, error)
 			return nil, fmt.Errorf("file %q is no longer uploaded", f.Name)
 		}
 	}
+	if s.Image == "" && len(args) == 3 && args[0] == "sh" && args[2] == s.Command {
+		return nil, errors.New("this command uses shell syntax (; && | > $ * …), which needs a shell: " +
+			"choose an image (the agent-only guest has no /bin/sh)")
+	}
+	if err := validNet(s.Net, s.Allow); err != nil {
+		return nil, err
+	}
+	if err := validDisplay(s.Display); err != nil {
+		return nil, err
+	}
+	if s.Display != "" && s.Image == "" {
+		return nil, errors.New("a display needs an image with a desktop (Xorg); the agent-only guest can't draw anything")
+	}
 	if s.Image != "" {
 		if _, ok := lib.path(s.Image); !ok {
 			return nil, fmt.Errorf("image %q not found", s.Image)
@@ -112,7 +180,7 @@ type RunInfo struct {
 	ID          string    `json:"id"`
 	Spec        RunSpec   `json:"spec"`
 	Args        []string  `json:"args"`
-	Status      string    `json:"status"` // booting, running, succeeded, failed, timed_out, stopped, error
+	Status      string    `json:"status"` // preparing, booting, running, succeeded, failed, timed_out, stopped, error
 	ExitCode    *int      `json:"exit_code,omitempty"`
 	Error       string    `json:"error,omitempty"`
 	Created     time.Time `json:"created"`
@@ -131,6 +199,18 @@ type RunInfo struct {
 	Filtered    int       `json:"filtered"` // control sequences removed from output
 	Truncated   bool      `json:"truncated"`
 	Interactive bool      `json:"interactive"`
+	Display     *Screen   `json:"display,omitempty"`
+	Net         string    `json:"net"`          // effective mode
+	NetConns    int       `json:"net_conns"`    // connections opened
+	NetBlocked  int       `json:"net_blocked"`  // lookups and connections refused
+	NetSent     int64     `json:"net_sent"`     // bytes, guest to world
+	NetReceived int64     `json:"net_received"` // bytes, world to guest
+}
+
+// Screen is a run's display size.
+type Screen struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }
 
 type run struct {
@@ -141,11 +221,13 @@ type run struct {
 	subs map[chan Chunk]struct{}
 	done chan struct{}
 
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stopped bool
-	files   []string // upload ids to delete when the run ends
-	filters map[string]*termsafe.Writer
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stopped  bool
+	files    []string // upload ids to delete when the run ends
+	filters  map[string]*termsafe.Writer
+	onChange func() // tells the run list its state changed
+	vncSock  string // the run's VNC Unix socket, if it has a display
 }
 
 type runManager struct {
@@ -155,10 +237,47 @@ type runManager struct {
 	mu   sync.Mutex
 	runs map[string]*run
 	seq  int
+
+	changeMu sync.Mutex
+	changed  chan struct{} // closed (and replaced) whenever any run changes
+
+	sockOnce sync.Once
+	sockDir  string // private directory (0700) for runs' VNC sockets
+	sockErr  error
+}
+
+// socketDir returns the private directory for VNC sockets: only this
+// user can reach a run's screen, and only through the UI.
+func (m *runManager) socketDir() (string, error) {
+	m.sockOnce.Do(func() {
+		base := os.Getenv("XDG_RUNTIME_DIR")
+		if base == "" {
+			base = os.TempDir()
+		}
+		m.sockDir, m.sockErr = os.MkdirTemp(base, "ksar-ui-")
+	})
+	return m.sockDir, m.sockErr
 }
 
 func newRunManager(cfg Config, up *uploadStore, lib *imageLibrary) *runManager {
-	return &runManager{cfg: cfg, up: up, lib: lib, runs: map[string]*run{}}
+	m := &runManager{cfg: cfg, up: up, lib: lib, runs: map[string]*run{}, changed: make(chan struct{})}
+	m.loadHistory()
+	return m
+}
+
+// changes returns a channel that is closed at the next change to the run
+// list (a run starting, changing state, or its metrics updating).
+func (m *runManager) changes() <-chan struct{} {
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
+	return m.changed
+}
+
+func (m *runManager) bump() {
+	m.changeMu.Lock()
+	close(m.changed)
+	m.changed = make(chan struct{})
+	m.changeMu.Unlock()
 }
 
 func (m *runManager) list() []RunInfo {
@@ -213,6 +332,25 @@ func (m *runManager) start(spec RunSpec) (*run, error) {
 	if spec.Interactive {
 		argv = append(argv, "-i")
 	}
+	id := newID()
+	argv = append(argv, "-id", id) // the same id in ksar ps and ksar stop
+	var vncSock string
+	if spec.Display != "" {
+		dir, err := m.socketDir()
+		if err != nil {
+			return nil, fmt.Errorf("display socket: %w", err)
+		}
+		vncSock = filepath.Join(dir, id+".sock")
+		// -desktop: start X and XFCE, installing them into a cached layer
+		// first if the image has none; the command runs on the desktop.
+		argv = append(argv, "-display", spec.Display, "-vnc", "unix:"+vncSock, "-desktop")
+	}
+	if spec.Net != "" && spec.Net != netproxy.ModeNone {
+		argv = append(argv, "-net", spec.Net)
+		for _, a := range spec.Allow {
+			argv = append(argv, "-allow", a)
+		}
+	}
 	argv = append(argv, "--")
 	argv = append(argv, args...)
 
@@ -238,13 +376,12 @@ func (m *runManager) start(spec RunSpec) (*run, error) {
 		stdin, _ = cmd.StdinPipe()
 	}
 
-	id := newID()
 	r := &run{
 		info: RunInfo{ID: id, Spec: spec, Args: args, Status: "booting", Created: time.Now(),
-			Interactive: spec.Interactive},
+			Interactive: spec.Interactive, Net: netproxy.ModeNone},
 		size: map[string]int{}, subs: map[chan Chunk]struct{}{}, done: make(chan struct{}),
 		cmd: cmd, stdin: stdin, files: uploads,
-		filters: map[string]*termsafe.Writer{},
+		filters: map[string]*termsafe.Writer{}, onChange: m.bump, vncSock: vncSock,
 	}
 	if err := cmd.Start(); err != nil {
 		evR.Close()
@@ -259,8 +396,15 @@ func (m *runManager) start(spec RunSpec) (*run, error) {
 
 	m.mu.Lock()
 	m.runs[id] = r
-	m.trimLocked()
+	dropped := m.trimLocked()
 	m.mu.Unlock()
+	m.bump()
+	m.save(r, false)
+	if m.cfg.HistoryDir != "" {
+		for _, old := range dropped {
+			os.Remove(filepath.Join(m.cfg.HistoryDir, old+".json.gz"))
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(4)
@@ -273,6 +417,10 @@ func (m *runManager) start(spec RunSpec) (*run, error) {
 		wg.Wait()
 		err := cmd.Wait()
 		r.finish(err)
+		m.save(r, true)
+		if vncSock != "" {
+			os.Remove(vncSock) // ksar run can't: it is locked down
+		}
 		for _, u := range r.files {
 			m.up.remove(u)
 		}
@@ -280,10 +428,11 @@ func (m *runManager) start(spec RunSpec) (*run, error) {
 	return r, nil
 }
 
-// trimLocked drops the oldest finished runs beyond maxRuns.
-func (m *runManager) trimLocked() {
+// trimLocked drops the oldest finished runs beyond maxRuns, returning
+// their ids.
+func (m *runManager) trimLocked() []string {
 	if len(m.runs) <= maxRuns {
-		return
+		return nil
 	}
 	var finished []*run
 	for _, r := range m.runs {
@@ -294,12 +443,15 @@ func (m *runManager) trimLocked() {
 		}
 	}
 	sort.Slice(finished, func(i, j int) bool { return finished[i].info.Created.Before(finished[j].info.Created) })
+	var dropped []string
 	for _, r := range finished {
 		if len(m.runs) <= maxRuns {
 			break
 		}
 		delete(m.runs, r.info.ID)
+		dropped = append(dropped, r.info.ID)
 	}
+	return dropped
 }
 
 func (m *runManager) stopAll() {
@@ -317,6 +469,9 @@ func (m *runManager) stopAll() {
 		case <-r.done:
 		case <-time.After(5 * time.Second):
 		}
+	}
+	if m.sockDir != "" {
+		os.RemoveAll(m.sockDir)
 	}
 }
 
@@ -416,24 +571,59 @@ func (r *run) readEvents(rd io.ReadCloser) {
 	sc.Buffer(make([]byte, 64<<10), 64<<10)
 	for sc.Scan() {
 		var ev struct {
-			Event    string `json:"event"`
-			Scope    string `json:"scope"`
-			Virtio   bool   `json:"virtio"`
-			Kernel   string `json:"kernel"`
-			Lockdown bool   `json:"lockdown"`
-			MemLimit int64  `json:"mem_limit"`
-			BootMs   int64  `json:"boot_ms"`
-			CID      uint32 `json:"cid"`
-			Message  string `json:"message"`
+			Event    string          `json:"event"`
+			Scope    string          `json:"scope"`
+			Virtio   bool            `json:"virtio"`
+			Kernel   string          `json:"kernel"`
+			Lockdown bool            `json:"lockdown"`
+			MemLimit int64           `json:"mem_limit"`
+			BootMs   int64           `json:"boot_ms"`
+			CID      uint32          `json:"cid"`
+			Message  string          `json:"message"`
+			Net      json.RawMessage `json:"net"`
 		}
 		if json.Unmarshal(sc.Bytes(), &ev) != nil {
 			continue
 		}
 		r.mu.Lock()
 		switch ev.Event {
+		case "preparing":
+			r.info.Status = "preparing"
+		case "display":
+			var d Screen
+			if json.Unmarshal(sc.Bytes(), &d) == nil && d.Width > 0 {
+				r.info.Display = &d
+			}
 		case "started":
+			if r.info.Status == "preparing" {
+				r.info.Status = "booting" // the desktop is installed; the run itself starts
+			}
 			r.info.Scope, r.info.Virtio, r.info.Kernel = ev.Scope, ev.Virtio, ev.Kernel
 			r.info.Lockdown, r.info.MemLimit = ev.Lockdown, ev.MemLimit
+			var n struct{ Mode string }
+			if json.Unmarshal(ev.Net, &n) == nil && n.Mode != "" {
+				r.info.Net = n.Mode
+			}
+		case "net":
+			// Kept in the log as its own stream (JSON per chunk), so the
+			// browser's network panel replays and resumes like output.
+			var n netproxy.Event
+			if json.Unmarshal(ev.Net, &n) != nil {
+				break
+			}
+			switch {
+			case n.Kind == "close":
+				r.info.NetSent += n.Sent
+				r.info.NetReceived += n.Received
+			case !n.Allowed:
+				r.info.NetBlocked++
+			case n.Kind == "connect":
+				r.info.NetConns++
+			}
+			b, _ := json.Marshal(n)
+			r.mu.Unlock()
+			r.append("net", string(b))
+			r.mu.Lock()
 		case "ready":
 			r.info.Status, r.info.BootMs, r.info.CID = "running", ev.BootMs, ev.CID
 		case "error":
@@ -448,6 +638,9 @@ func (r *run) readEvents(rd io.ReadCloser) {
 // aren't stored in the log: a (re)connecting client fetches the current
 // state anyway.
 func (r *run) notify() {
+	if r.onChange != nil {
+		r.onChange()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for ch := range r.subs {
@@ -474,7 +667,7 @@ func (r *run) finish(waitErr error) {
 	r.info.ExitCode = &code
 	r.info.Ended = time.Now()
 	switch {
-	case r.stopped:
+	case r.stopped, code == 128+int(syscall.SIGTERM): // here, or by ksar stop
 		r.info.Status = "stopped"
 	case code == 0:
 		r.info.Status = "succeeded"
@@ -665,10 +858,16 @@ func cpuUsec(dir string) int64 {
 // splitCommand splits a command line like a POSIX shell would for words
 // and quotes ('...', "...", backslash), without any expansion. To get
 // shell features, run a shell: sh -c '...'.
+// shellChars are what make a command line need a shell when unquoted:
+// ; & | (operators), < > (redirection), $ ` (expansion), * ? [ (globs),
+// ( ) (subshells).
+const shellChars = ";&|<>$`*?[()"
+
 func splitCommand(s string) ([]string, error) {
 	var args []string
 	var cur strings.Builder
 	inWord := false
+	shell := false // unquoted shell syntax seen
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
@@ -705,6 +904,9 @@ func splitCommand(s string) ([]string, error) {
 				inWord = false
 			}
 		default:
+			if strings.IndexByte(shellChars, c) >= 0 || c == '~' && !inWord {
+				shell = true
+			}
 			cur.WriteByte(c)
 			inWord = true
 		}
@@ -714,6 +916,11 @@ func splitCommand(s string) ([]string, error) {
 	}
 	if len(args) == 0 {
 		return nil, errors.New("command is empty")
+	}
+	if shell {
+		// Operators, redirections, variables or globs: the user means a
+		// shell command line, so the guest's shell runs it as typed.
+		return []string{"sh", "-c", s}, nil
 	}
 	return args, nil
 }

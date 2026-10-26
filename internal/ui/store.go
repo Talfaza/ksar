@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"ksar/internal/desktop"
 	"ksar/internal/image"
 )
 
@@ -235,6 +236,10 @@ type ImageInfo struct {
 	LastUsed  time.Time `json:"last_used,omitzero"`
 	Importing bool      `json:"importing"`
 	Error     string    `json:"error,omitempty"`
+	// Desktop: "ready", "preparing", "failed" or "" (installed on the
+	// first display run); DesktopNote: progress or what went wrong.
+	Desktop     string `json:"desktop"`
+	DesktopNote string `json:"desktop_note,omitempty"`
 }
 
 type imageLibrary struct {
@@ -242,10 +247,12 @@ type imageLibrary struct {
 	mu  sync.Mutex
 	// imports in progress or failed, by image name
 	jobs map[string]*ImageInfo
+	// desktops being prepared, or whose preparation failed (desktops.go)
+	desktops map[string]*desktopJob
 }
 
 func newImageLibrary(dir string) *imageLibrary {
-	return &imageLibrary{dir: dir, jobs: map[string]*ImageInfo{}}
+	return &imageLibrary{dir: dir, jobs: map[string]*ImageInfo{}, desktops: map[string]*desktopJob{}}
 }
 
 var validImageName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar$`)
@@ -278,6 +285,7 @@ func (l *imageLibrary) list() []ImageInfo {
 		if _, c, ok := image.Cached(filepath.Join(l.dir, e.Name())); ok {
 			img.Cached, img.CacheSize, img.LastUsed = true, c.Size(), c.ModTime()
 		}
+		img.Desktop, img.DesktopNote = l.desktopState(e.Name(), filepath.Join(l.dir, e.Name()))
 		seen[e.Name()] = true
 		out = append(out, img)
 	}
@@ -386,6 +394,7 @@ func (l *imageLibrary) remove(name string) error {
 	if c, _, cached := image.Cached(p); cached {
 		os.Remove(c)
 	}
+	desktop.Remove(p)
 	os.Remove(image.ConfigPath(p))
 	return os.Remove(p)
 }
@@ -398,6 +407,12 @@ func (l *imageLibrary) prune() (int64, error) {
 			keep[c] = true
 		}
 	}
+	layers, _ := desktop.Layers() // disks of desktop layers are in use too
+	for _, l := range layers {
+		if c, _, ok := image.Cached(l); ok {
+			keep[c] = true
+		}
+	}
 	return image.Prune(keep)
 }
 
@@ -405,8 +420,10 @@ func (l *imageLibrary) prune() (int64, error) {
 
 // Settings are the user's defaults.
 type Settings struct {
-	MemMB    int `json:"mem_mb"`
-	TimeoutS int `json:"timeout_s"`
+	MemMB    int      `json:"mem_mb"`
+	TimeoutS int      `json:"timeout_s"`
+	Net      string   `json:"net"`   // default network mode: none, allow, internet
+	Allow    []string `json:"allow"` // default allow list
 }
 
 type settingsStore struct {
@@ -416,7 +433,7 @@ type settingsStore struct {
 }
 
 func newSettingsStore() *settingsStore {
-	s := &settingsStore{cur: Settings{MemMB: 256, TimeoutS: 60}}
+	s := &settingsStore{cur: Settings{MemMB: 256, TimeoutS: 60, Net: "none"}}
 	if dir, err := os.UserConfigDir(); err == nil {
 		s.path = filepath.Join(dir, "ksar", "ui.json")
 		if b, err := os.ReadFile(s.path); err == nil {
@@ -436,7 +453,7 @@ func (v Settings) valid() error {
 	if v.TimeoutS < 1 || v.TimeoutS > maxTimeoutS {
 		return fmt.Errorf("timeout must be between 1 and %d seconds", maxTimeoutS)
 	}
-	return nil
+	return validNet(v.Net, v.Allow)
 }
 
 func (s *settingsStore) get() Settings {

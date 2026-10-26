@@ -119,13 +119,19 @@ func TestLoginSetsStrictCookieAndCleansURL(t *testing.T) {
 
 func TestSplitCommand(t *testing.T) {
 	cases := map[string][]string{
-		`echo hi`:                       {"echo", "hi"},
-		`  a   b  `:                     {"a", "b"},
-		`sh -c 'echo "$HOME"; ls'`:      {"sh", "-c", `echo "$HOME"; ls`},
-		`printf "a\"b" x\ y`:            {"printf", `a"b`, "x y"},
-		`a''b ""`:                       {"ab", ""},
-		`python3 -c "print('hi')"`:      {"python3", "-c", "print('hi')"},
-		`$(rm -rf /) ; echo $PATH | wc`: {"$(rm", "-rf", "/)", ";", "echo", "$PATH", "|", "wc"},
+		`echo hi`:                      {"echo", "hi"},
+		`  a   b  `:                    {"a", "b"},
+		`sh -c 'echo "$HOME"; ls'`:     {"sh", "-c", `echo "$HOME"; ls`},
+		`printf "a\"b" x\ y`:           {"printf", `a"b`, "x y"},
+		`a''b ""`:                      {"ab", ""},
+		`python3 -c "print('hi')"`:     {"python3", "-c", "print('hi')"},
+		`echo " hi "; ping google.com`: {"sh", "-c", `echo " hi "; ping google.com`},
+		`make && make test`:            {"sh", "-c", `make && make test`},
+		`ls *.py`:                      {"sh", "-c", `ls *.py`},
+		`cat ~/x > out`:                {"sh", "-c", `cat ~/x > out`},
+		`echo 'a;b|c' "$x"`:            {"echo", "a;b|c", "$x"},
+		`echo a\;b`:                    {"echo", "a;b"},
+		`curl https://x.org/a?b=1`:     {"sh", "-c", `curl https://x.org/a?b=1`},
 	}
 	for in, want := range cases {
 		got, err := splitCommand(in)

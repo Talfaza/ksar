@@ -98,6 +98,12 @@ func (c *Client) WaitReady() (proto.Ready, error) {
 	return r, nil
 }
 
+// Hello sends the run's id and entropy for the guest RNG. It must come
+// before anything else, so no command runs with a predictable RNG.
+func (c *Client) Hello(id string, entropy []byte) error {
+	return c.cw.WriteJSON(proto.TypeHello, proto.Hello{ID: id, Entropy: entropy})
+}
+
 // PutFile writes data from r to path inside the guest.
 func (c *Client) PutFile(path string, mode uint32, r io.Reader) error {
 	if err := c.cw.WriteJSON(proto.TypeFileOpen, proto.FileOpen{Path: path, Mode: mode}); err != nil {
@@ -219,4 +225,50 @@ func (c *Client) sendStdin(stdin io.Reader) {
 		}
 	}
 	c.cw.Write(proto.TypeStdinClose, nil)
+}
+
+// ErrExportTooLarge means the guest's changes exceeded the export limit.
+var ErrExportTooLarge = errors.New("the guest's changes exceed the size limit")
+
+// Export streams the guest's filesystem changes (see proto.Export) as a
+// tar into w, writing at most max bytes. The stream comes from the guest
+// and is untrusted: callers treat it like any image tar.
+func (c *Client) Export(w io.Writer, exclude []string, max int64) (files int, n int64, err error) {
+	if err := c.cw.WriteJSON(proto.TypeExport, proto.Export{Exclude: exclude}); err != nil {
+		return 0, 0, err
+	}
+	var werr error
+	for {
+		f, err := c.next()
+		if err != nil {
+			return 0, n, err
+		}
+		switch f.Type {
+		case proto.TypeExportData:
+			if werr != nil {
+				continue // keep draining so the protocol stays in step
+			}
+			if n+int64(len(f.Payload)) > max {
+				werr = ErrExportTooLarge
+				continue
+			}
+			var m int
+			m, werr = w.Write(f.Payload)
+			n += int64(m)
+		case proto.TypeResult:
+			var res proto.Result
+			if err := proto.Decode(f, &res); err != nil {
+				return 0, n, err
+			}
+			if werr != nil {
+				return res.Files, n, werr
+			}
+			if res.Error != "" {
+				return res.Files, n, fmt.Errorf("export: %s", res.Error)
+			}
+			return res.Files, n, nil
+		default:
+			return 0, n, fmt.Errorf("agent protocol error: unexpected frame %#x during export", f.Type)
+		}
+	}
 }

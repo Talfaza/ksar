@@ -4,15 +4,20 @@ package sandbox
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"ksar/internal/agent"
 	"ksar/internal/agent/proto"
+	"ksar/internal/display"
 	"ksar/internal/initramfs"
+	"ksar/internal/netproxy"
 	"ksar/internal/vmm"
 )
 
@@ -47,7 +52,30 @@ type Options struct {
 	// unpacked into the initramfs, which works with any kernel.
 	Virtio   bool
 	RootDisk string    // Virtio: EROFS image path (optional: agent only)
+	Layers   []string  // Virtio: EROFS layers stacked on RootDisk, topmost first
 	Image    io.Reader // legacy: root filesystem tar (optional)
+
+	// Net, if set, gives the guest a network card (eth0, 10.0.2.15/24)
+	// bridged to a network proxy. Virtio only. Nil means no network.
+	Net *vmm.Net
+
+	// Display, if set, gives the guest a screen, keyboard and tablet
+	// (virtio mode only). Viewers connect over VNC to Listeners, which
+	// must be open before the VM starts (lockdown forbids new sockets).
+	// SaveChanges, if set, receives the guest's filesystem changes as a
+	// tar (a layer for Layers) when the command exits 0. MaxSave bounds
+	// its size (default 4 GiB). It must be open before the run, since
+	// lockdown forbids opening files.
+	SaveChanges io.Writer
+	MaxSave     int64
+	SaveResult  *SaveResult // filled in when SaveChanges is set
+
+	Display   *vmm.Display
+	Listeners []net.Listener
+	VNCAuth   display.Auth
+
+	// ID is the VM's id; the guest finds it in /run/ksar/id.
+	ID string
 
 	Timeout time.Duration
 	Console io.Writer // if set, the guest kernel log is shown here (verbose)
@@ -67,6 +95,14 @@ type Options struct {
 	Stdin  io.Reader // nil: empty stdin
 	Stdout io.Writer
 	Stderr io.Writer
+}
+
+// SaveResult reports a SaveChanges export.
+type SaveResult struct {
+	Saved bool
+	Files int
+	Bytes int64
+	Err   error
 }
 
 // Result describes a finished run.
@@ -108,12 +144,40 @@ func Run(opts Options) (Result, error) {
 	if opts.Virtio {
 		tarball = nil
 		cfg.Vsock = true
+		if opts.Net != nil {
+			cfg.Net = opts.Net
+			// Static configuration by the kernel itself (CONFIG_IP_PNP):
+			// address, gateway, netmask, hostname, device, no
+			// autoconfiguration, DNS server. The agent turns the DNS entry
+			// in /proc/net/pnp into /etc/resolv.conf.
+			// The network is IPv4 only.
+			cfg.Cmdline += fmt.Sprintf(" ipv6.disable=1 ip=%s::%s:%s:ksar:eth0:off:%s",
+				netproxy.GuestAddr, netproxy.GatewayAddr, netproxy.Netmask, netproxy.DNSAddr)
+		}
+		cfg.Display = opts.Display
 		if opts.RootDisk != "" {
 			cfg.Disks = []vmm.Disk{{Path: opts.RootDisk, ReadOnly: true}}
 			cfg.Cmdline += " ksar.root=/dev/vda"
+			var devs []string
+			for i, l := range opts.Layers {
+				cfg.Disks = append(cfg.Disks, vmm.Disk{Path: l, ReadOnly: true})
+				devs = append(devs, "/dev/vd"+string(rune('b'+i)))
+			}
+			if len(devs) > 0 {
+				cfg.Cmdline += " ksar.layers=" + strings.Join(devs, ",")
+			}
+		} else if len(opts.Layers) > 0 || opts.SaveChanges != nil {
+			return res, errors.New("layers and saving changes need an image")
 		}
 	} else {
 		cfg.AgentChannel = true
+		if opts.Net != nil {
+			opts.Net.Backend.Close()
+			return res, errors.New("networking needs the Ksar kernel (virtio mode)")
+		}
+		if opts.Display != nil {
+			return res, errors.New("the display needs the Ksar kernel (virtio mode)")
+		}
 	}
 	var err error
 	if cfg.Initrd, err = buildInitramfs(opts.Agent, tarball); err != nil {
@@ -124,6 +188,12 @@ func Run(opts Options) (Result, error) {
 		return res, err
 	}
 	defer m.Close()
+	if s := m.Screen(); s != nil {
+		for _, l := range opts.Listeners {
+			go serveViewers(l, s, opts.VNCAuth)
+			defer l.Close()
+		}
+	}
 	if opts.Lockdown != nil {
 		if err := opts.Lockdown(); err != nil {
 			return res, fmt.Errorf("lockdown: %w", err)
@@ -196,10 +266,43 @@ func Run(opts Options) (Result, error) {
 	return res, nil
 }
 
+// maxViewers bounds concurrent VNC connections per VM.
+const maxViewers = 4
+
+func serveViewers(l net.Listener, s *display.Screen, auth display.Auth) {
+	slots := make(chan struct{}, maxViewers)
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return // listener closed: the run is over
+		}
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				s.Serve(c, auth)
+			}()
+		default:
+			c.Close()
+		}
+	}
+}
+
 func session(ch io.ReadWriter, opts Options, start time.Time, cid uint32) (proto.Exit, time.Duration, error) {
 	c := agent.NewClient(ch)
-	if _, err := c.WaitReady(); err != nil {
+	ready, err := c.WaitReady()
+	if err != nil {
 		return proto.Exit{}, 0, fmt.Errorf("waiting for agent: %w", err)
+	}
+	entropy := make([]byte, 64)
+	rand.Read(entropy)
+	if err := c.Hello(opts.ID, entropy); err != nil {
+		return proto.Exit{}, 0, err
+	}
+	for _, n := range ready.Notes {
+		if len(n) <= 500 { // from the guest: printed as plain text, bounded
+			fmt.Fprintf(opts.Stderr, "ksar: note: %s\n", n)
+		}
 	}
 	boot := time.Since(start)
 	if opts.OnReady != nil {
@@ -216,6 +319,16 @@ func session(ch io.ReadWriter, opts Options, start time.Time, cid uint32) (proto
 		}
 	}
 	exit, err := c.Run(opts.Exec, opts.Stdin, opts.Stdout, opts.Stderr)
+	if err == nil && opts.SaveChanges != nil && exit.Code == 0 && exit.Signal == "" {
+		max := opts.MaxSave
+		if max <= 0 {
+			max = 4 << 30
+		}
+		files, n, serr := c.Export(opts.SaveChanges, nil, max)
+		if opts.SaveResult != nil {
+			*opts.SaveResult = SaveResult{Saved: serr == nil, Files: files, Bytes: n, Err: serr}
+		}
+	}
 	return exit, boot, err
 }
 

@@ -74,6 +74,10 @@ func TestFilterLogic(t *testing.T) {
 		{"execve", x86, 59, nil, retTrap},
 		{"socket", x86, 41, nil, retTrap},
 		{"connect", x86, 42, nil, retTrap},
+		{"getsockname", x86, 51, nil, retAllow},
+		{"setsockopt TCP_NODELAY", x86, nrSetsockopt, []uint64{5, 6, 1}, retAllow},
+		{"setsockopt SO_REUSEADDR", x86, nrSetsockopt, []uint64{5, 1, 2}, retTrap},
+		{"setsockopt TCP other", x86, nrSetsockopt, []uint64{5, 6, 4}, retTrap},
 		{"ptrace", x86, 101, nil, retTrap},
 		{"fork", x86, 57, nil, retTrap},
 		{"clone thread", x86, nrClone, []uint64{0x50f00}, retAllow},
@@ -87,6 +91,8 @@ func TestFilterLogic(t *testing.T) {
 		{"vhost", x86, nrIoctl, []uint64{5, 0x4008AF61}, retAllow},
 		{"KVM_SET_USER_MEMORY_REGION", x86, nrIoctl, []uint64{5, 0x4020AE46}, retTrap},
 		{"KVM_CREATE_VM", x86, nrIoctl, []uint64{5, 0xAE01}, retTrap},
+		{"KVM_GET_REGS", x86, nrIoctl, []uint64{5, 0x8090AE81}, retTrap},
+		{"KVM_SET_REGS", x86, nrIoctl, []uint64{5, 0x4090AE82}, retTrap},
 		{"TIOCSTI (type into tty)", x86, nrIoctl, []uint64{0, 0x5412}, retTrap},
 		{"ioctl high bits", x86, nrIoctl, []uint64{5, 1<<32 | 0xAE80}, retTrap},
 		{"x32 read", x86, x32SyscallBit | 0, nil, retKill},
@@ -94,6 +100,41 @@ func TestFilterLogic(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := p.run(t, c.arch, c.nr, c.args...); got != c.want {
+			t.Errorf("%s: got %#x, want %#x", c.name, got, c.want)
+		}
+	}
+}
+
+func TestProxyFilterLogic(t *testing.T) {
+	p := proxyFilter()
+	const x86 = auditArchX86_64
+	cases := []struct {
+		name string
+		nr   uint32
+		args []uint64
+		want uint32
+	}{
+		{"read", 0, nil, retAllow},
+		{"connect", 42, nil, retAllow},
+		{"socket inet", nrSocket, []uint64{afInet, 1}, retAllow},
+		{"socket inet6", nrSocket, []uint64{afInet6, 2}, retAllow},
+		{"socket unix", nrSocket, []uint64{1, 1}, retTrap},
+		{"socket netlink", nrSocket, []uint64{16, 3}, retTrap},
+		{"socket packet", nrSocket, []uint64{17, 3}, retTrap},
+		{"openat read", nrOpenat, []uint64{0, 0, 0x80000}, retAllow},
+		{"openat write", nrOpenat, []uint64{0, 0, 1}, retTrap},
+		{"openat rdwr", nrOpenat, []uint64{0, 0, 2}, retTrap},
+		{"openat creat", nrOpenat, []uint64{0, 0, 0x40}, retTrap},
+		{"openat tmpfile", nrOpenat, []uint64{0, 0, 0x410000}, retTrap},
+		{"execve", 59, nil, retTrap},
+		{"accept4", 288, nil, retTrap},
+		{"ioctl", nrIoctl, []uint64{0, 0x5412}, retTrap},
+		{"KVM_RUN", nrIoctl, []uint64{5, 0xAE80}, retTrap},
+		{"clone process", nrClone, []uint64{0x11}, retTrap},
+		{"mmap exec", nrMmap, []uint64{0, 4096, 7}, retTrap},
+	}
+	for _, c := range cases {
+		if got := p.run(t, x86, c.nr, c.args...); got != c.want {
 			t.Errorf("%s: got %#x, want %#x", c.name, got, c.want)
 		}
 	}

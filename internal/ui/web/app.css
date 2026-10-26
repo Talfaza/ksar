@@ -115,8 +115,6 @@ button:disabled { cursor: default; opacity: 0.4; }
 .nav a > span:nth-child(2) { flex: 1; }
 .nav .count { font: 600 0.6875rem/1 var(--font); color: var(--label-2); background: var(--fill); padding: 0.2rem 0.45rem; border-radius: 99px; }
 .nav .count:empty { display: none; }
-.side-status { margin-top: auto; padding: 0.75rem; border-radius: var(--radius); background: var(--fill); display: flex; flex-direction: column; gap: 0.35rem; }
-.side-status .row { font-size: 0.75rem; }
 
 .main { min-width: 0; outline: none; }
 .view { padding: 0 2rem 4rem; max-width: 84rem; margin: 0 auto; will-change: transform, opacity; }
@@ -142,6 +140,8 @@ button:disabled { cursor: default; opacity: 0.4; }
 .row { display: flex; align-items: center; gap: 0.5rem; }
 .row.wrap { flex-wrap: wrap; }
 .spacer { flex: 1; }
+/* Layout classes set display; the hidden attribute must still win. */
+[hidden] { display: none !important; }
 .stack { display: flex; flex-direction: column; gap: 1rem; }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 21rem; gap: 1.25rem; align-items: start; }
 .sticky-col { position: sticky; top: 4rem; }
@@ -184,8 +184,8 @@ button:disabled { cursor: default; opacity: 0.4; }
 /* ---------- Status ---------- */
 .status { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 590; font-size: 0.8125rem; white-space: nowrap; }
 .status .dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: currentColor; flex: none; }
-.status.running, .status.booting { color: var(--accent); }
-.status.running .dot, .status.booting .dot { animation: breathe 1.6s ease-in-out infinite; }
+.status.running, .status.booting, .status.preparing { color: var(--accent); }
+.status.running .dot, .status.booting .dot, .status.preparing .dot { animation: breathe 1.6s ease-in-out infinite; }
 .status.succeeded { color: var(--green); }
 .status.failed, .status.error { color: var(--red); }
 .status.timed_out { color: var(--orange); }
@@ -215,6 +215,8 @@ button:disabled { cursor: default; opacity: 0.4; }
 }
 .seg.dragging .seg-item { pointer-events: none; }
 .seg-item[aria-checked="true"] { font-weight: 600; }
+.seg-label { display: inline-flex; flex-direction: column; align-items: center; }
+.seg-label::after { content: attr(data-text); font-weight: 600; height: 0; overflow: hidden; visibility: hidden; user-select: none; pointer-events: none; }
 .seg-item .tag { font-size: 0.625rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--green); }
 .seg-item .n { color: var(--label-2); font-weight: 500; font-variant-numeric: tabular-nums; }
 .seg.large .seg-item { padding: 0.5rem 0.6rem; font-size: 0.875rem; }
@@ -391,7 +393,7 @@ body.signin p { color: var(--label-2); margin: 0; }
 @media (max-width: 860px) {
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { position: sticky; z-index: 10; height: auto; flex-direction: row; align-items: center; padding: 0.5rem 0.75rem; border-right: 0; border-bottom: 1px solid var(--separator); gap: 0.5rem; }
-  .brand b, .side-status { display: none; }
+  .brand b { display: none; }
   .nav { flex-direction: row; overflow-x: auto; }
   .nav a > span:nth-child(2) { white-space: nowrap; }
   .view { padding: 0 1rem 3rem; }
@@ -422,3 +424,42 @@ body.signin p { color: var(--label-2); margin: 0; }
   .group, .table-wrap, .image-card, .input, .seg { box-shadow: inset 0 0 0 1px var(--label-2); }
   .sidebar, .toolbar.scrolled, .sheet-foot, .toast { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--surface); }
 }
+
+/* Project suggestion */
+.project-card { display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.75rem 0.9rem; border-radius: var(--radius); background: var(--accent-fill); }
+.project-card.applied { background: var(--fill); }
+.project-card > .ico { margin-top: 0.15rem; flex: none; }
+.project-card .text { display: flex; flex-direction: column; gap: 0.25rem; flex: 1; min-width: 0; }
+.project-card code { font-size: 0.8125rem; overflow-wrap: anywhere; color: var(--label); }
+.project-card .btn, .project-card .badge { flex: none; align-self: center; }
+
+.project-card select { max-width: 100%; }
+.ai-status { display: inline-flex; align-items: center; gap: 0.4rem; }
+.spinner { width: 0.8rem; height: 0.8rem; border-radius: 50%; border: 2px solid var(--separator); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+
+/* Display */
+.display-pane { display: flex; flex-direction: column; background: #000; min-height: 16rem; }
+.display-pane:fullscreen { justify-content: center; }
+.display-bar { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.75rem; background: #161618; color: #f2f2f7; }
+.display-bar .t-foot { color: rgba(235, 235, 245, 0.6); }
+.display-bar .btn { color: #ff7a52; background: rgba(118, 118, 128, 0.24); }
+/* Scaled by its own aspect ratio (never letterboxed), so pointer positions map 1:1. */
+canvas.screen { display: block; align-self: center; width: auto; height: auto; max-width: 100%; max-height: 75vh; cursor: none; outline: none; background: #000; }
+.display-pane:fullscreen canvas.screen { max-height: calc(100vh - 2.5rem); }
+canvas.screen:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.display-empty { color: #f2f2f7; }
+
+/* Network */
+.chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+textarea.input { resize: vertical; min-height: 5.5rem; line-height: 1.45; }
+.netlog { white-space: pre-wrap; overflow-wrap: anywhere; }
+.netlog > div { padding: 0.08rem 0; }
+
+/* An image's desktop state on the Images page */
+.desktop-state { display: flex; align-items: center; gap: 0.35rem; margin-top: 0.15rem; }
+.desktop-state svg { width: 0.95rem; height: 0.95rem; flex: none; }
+.desktop-state.ok { color: var(--green); }
+.desktop-state.warn { color: var(--orange); }
+.desktop-log { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 36rem; opacity: 0.8; }

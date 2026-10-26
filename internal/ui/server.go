@@ -46,7 +46,9 @@ type Config struct {
 	KsarPath  string // ksar binary used for runs
 	Kernel    string // kernel path passed to runs ("" = ksar's default)
 	ImagesDir string // directory of root filesystem tars
-	Status    func() Status
+	// HistoryDir keeps finished runs across restarts ("" = memory only).
+	HistoryDir string
+	Status     func() Status
 }
 
 // Server is the web UI.
@@ -61,6 +63,7 @@ type Server struct {
 	images *imageLibrary
 	up     *uploadStore
 	set    *settingsStore
+	ai     *assistant
 	http   *http.Server
 }
 
@@ -98,6 +101,7 @@ func New(cfg Config) (*Server, error) {
 		up:     up,
 		set:    newSettingsStore(),
 		images: newImageLibrary(cfg.ImagesDir),
+		ai:     &assistant{},
 	}
 	s.runs = newRunManager(cfg, s.up, s.images)
 	s.http = &http.Server{
@@ -227,11 +231,11 @@ func (s *Server) routes() http.Handler {
 
 // publicAssets are served without a session: the sign-in page needs
 // them, and they contain nothing sensitive.
-var publicAssets = map[string]bool{"/app.css": true, "/mascot.png": true}
+var publicAssets = map[string]bool{"/app.css": true, "/mascot.png": true, "/mascot-missing.png": true}
 
 const signInPage = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Ksar: sign in</title><link rel="stylesheet" href="/app.css"></head>
-<body class="signin"><main><img src="/mascot.png" alt="" width="96" height="96">
+<body class="signin"><main><img src="/mascot-missing.png" alt="" width="96" height="96">
 <h1>Open Ksar from your terminal</h1>
 <p>For your safety, this page only works through the one-time link that
 <code>ksar ui</code> printed when it started. Open that link to sign in.</p>

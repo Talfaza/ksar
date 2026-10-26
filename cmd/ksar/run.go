@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
@@ -18,8 +19,11 @@ import (
 
 	"ksar/internal/agent/proto"
 	"ksar/internal/agentbin"
+	"ksar/internal/desktop"
 	"ksar/internal/harden"
 	imagecache "ksar/internal/image"
+	"ksar/internal/netproxy"
+	"ksar/internal/registry"
 	"ksar/internal/sandbox"
 	"ksar/internal/termsafe"
 )
@@ -65,12 +69,24 @@ Flags:
 	raw := fs.Bool("raw", false, "pass guest output to the terminal unfiltered, including control sequences")
 	eventsFD := fs.Int("events-fd", -1, "write machine-readable JSON events to this open file descriptor (for the web UI)")
 	consoleFD := fs.Int("console-fd", -1, "write the guest kernel log to this open file descriptor (for the web UI)")
-	var copies, envs multiFlag
+	displayFlag := fs.String("display", "", "give the guest a screen: on (1280x800) or WIDTHxHEIGHT; view it over VNC (see -vnc)")
+	var vncAddrs multiFlag
+	fs.Var(&vncAddrs, "vnc", "with -display: serve VNC on 127.0.0.1:PORT (password printed) or unix:PATH (repeatable; default 127.0.0.1:0, a free port)")
+	idFlag := fs.String("id", "", "this VM's id, shown by ksar ps and used by ksar stop (default: a random 12-character id)")
+	label := fs.String("label", "", "a short description shown by ksar ps instead of the command")
+	desktopFlag := fs.Bool("desktop", false, "with -display: start X and a desktop, then run COMMAND on it (no COMMAND: just the desktop). "+
+		"If the image has no desktop, a minimal XFCE is installed once, in a VM, and cached as a layer")
+	saveChanges := fs.String("save-changes", "", "if COMMAND exits 0, save the guest's filesystem changes to this tar (usable with -layer)")
+	var layerTars multiFlag
+	fs.Var(&layerTars, "layer", "stack this tar (e.g. from -save-changes) on the image, read-only (repeatable, topmost first)")
+	netMode := fs.String("net", "none", "network access: none (no network card), allow (only -allow hosts) or internet (any public address)")
+	var copies, envs, allow multiFlag
+	fs.Var(&allow, "allow", "with -net allow: a host the guest may reach, e.g. pypi.org, *.pythonhosted.org, github.com:443, 1.2.3.4, 10.0.0.0/8:8080 (repeatable, or comma-separated)")
 	fs.Var(&copies, "copy", "copy a host file or directory into the guest: HOST_PATH:GUEST_PATH (repeatable)")
 	fs.Var(&envs, "e", "set an environment variable: KEY=VALUE (repeatable)")
 	fs.Parse(args)
 
-	if fs.NArg() == 0 {
+	if fs.NArg() == 0 && !*desktopFlag {
 		fs.Usage()
 		return 2
 	}
@@ -96,7 +112,71 @@ Flags:
 			limits.MemoryMax += st.Size() * 3
 		}
 	}
-	if err := enterScope(*cgroup, limits, *verbose); err != nil {
+	// Every VM has an id. It is chosen once, here, and handed to the
+	// re-executed ksar in its cgroup scope (see enterScope).
+	vmID := *idFlag
+	if vmID == "" {
+		vmID = registry.NewID()
+	}
+	if !registry.ValidID(vmID) {
+		return fail(fmt.Errorf("-id %q: use lower-case letters, digits and -, up to 32 characters", vmID))
+	}
+	entry := registry.Entry{ID: vmID, Status: "preparing", Image: *image, Command: fs.Args(), Label: *label,
+		MemMB: int(memSize >> 20), Display: *displayFlag, Net: *netMode}
+	if *desktopFlag && len(fs.Args()) == 0 && *label == "" {
+		entry.Label = "desktop"
+	}
+	reg, err := registry.Register(entry)
+	if err != nil {
+		if strings.Contains(err.Error(), "already running") {
+			return fail(err)
+		}
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[ksar] not listed by ksar ps: %v\n", err)
+		}
+	}
+	defer func() { // the exit status is set at the end of cmdRun
+		if reg != nil && reg.Entry().Status != "exited" {
+			reg.Update(func(e *registry.Entry) { e.Status = "exited" })
+		}
+	}()
+	ev.emit("id", map[string]any{"id": vmID})
+	// ksar stop sends SIGTERM; record how the VM ended before going.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		s := <-sigs
+		code := 128 + int(s.(syscall.Signal))
+		reg.Update(func(e *registry.Entry) { e.Status, e.ExitCode = "exited", &code })
+		ev.emit("exit", map[string]any{"code": code})
+		os.Exit(code)
+	}()
+
+	// The desktop install is its own ksar run (its own VM, scope and
+	// lockdown), so it happens before this one sets up anything.
+	execArgs := fs.Args()
+	if *desktopFlag {
+		if *displayFlag == "" {
+			*displayFlag = "on"
+		}
+		if *image == "" {
+			return fail(errors.New("-desktop needs -image"))
+		}
+		info, err := desktop.Inspect(*image)
+		if err != nil {
+			return fail(err)
+		}
+		if !info.Ready() {
+			ev.emit("preparing", map[string]any{"what": "desktop"})
+			layer, err := desktop.Ensure(*image, cliBuilder(*lockdown, *kernel), os.Stderr)
+			if err != nil {
+				return fail(err)
+			}
+			layerTars = append(layerTars, layer)
+		}
+		execArgs = desktop.Session(execArgs)
+	}
+	if err := enterScope(*cgroup, limits, *verbose, vmID); err != nil {
 		return fail(err)
 	}
 	if *verbose {
@@ -141,11 +221,37 @@ Flags:
 	}
 
 	virtioMode := isKsarKernel(kernelData) && !*legacy
+	policy, err := parseNet(*netMode, allow)
+	if err != nil {
+		return fail(err)
+	}
+	disp, err := parseDisplay(*displayFlag)
+	if err != nil {
+		return fail(err)
+	}
+	if disp == nil && len(vncAddrs) > 0 {
+		return fail(errors.New("-vnc needs -display"))
+	}
+	if disp != nil && !virtioMode {
+		return fail(errors.New("-display needs the Ksar kernel (build it with `make kernel`) and no -legacy"))
+	}
+	if policy != nil && !virtioMode {
+		return fail(errors.New("-net needs the Ksar kernel (build it with `make kernel`) and no -legacy"))
+	}
+	netInfo := map[string]any{"mode": netproxy.ModeNone}
+	if policy != nil {
+		netInfo = map[string]any{"mode": policy.Mode, "allow": policy.Allow}
+	}
 	ev.emit("started", map[string]any{
 		"pid": os.Getpid(), "scope": os.Getenv(scopeEnv), "virtio": virtioMode,
 		"kernel": kernelVersion(kernelData), "mem": memSize, "mem_limit": limits.MemoryMax,
 		"timeout_ms": timeout.Milliseconds(), "lockdown": *lockdown, "image": *image,
+		"net": netInfo, "id": vmID,
 	})
+	reg.Update(func(e *registry.Entry) { e.Status, e.Scope = "booting", os.Getenv(scopeEnv) })
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[ksar] vm %s\n", vmID)
+	}
 	opts := sandbox.Options{
 		Virtio:  virtioMode,
 		Kernel:  kernelData,
@@ -154,7 +260,7 @@ Flags:
 		Timeout: *timeout,
 		Files:   files,
 		Dirs:    dirs,
-		Exec:    proto.Exec{Args: fs.Args(), Env: envs, Dir: *workdir},
+		Exec:    proto.Exec{Args: execArgs, Env: envs, Dir: *workdir},
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 	}
@@ -165,6 +271,13 @@ Flags:
 			return fail(err)
 		}
 		opts.RootDisk = disk
+		for _, l := range layerTars {
+			d, err := imagecache.FromTar(l)
+			if err != nil {
+				return fail(fmt.Errorf("-layer %s: %w", l, err))
+			}
+			opts.Layers = append(opts.Layers, d)
+		}
 		if *verbose {
 			fmt.Fprintf(os.Stderr, "[ksar] image %s ready in %v\n", disk, time.Since(start).Round(time.Millisecond))
 		}
@@ -183,6 +296,46 @@ Flags:
 	}
 	if *interactive {
 		opts.Stdin = os.Stdin
+	}
+	if disp != nil {
+		opts.Display = disp
+		if len(vncAddrs) == 0 {
+			vncAddrs = multiFlag{"127.0.0.1:0"}
+		}
+		ls, auth, urls, err := listenVNC(vncAddrs)
+		if err != nil {
+			return fail(err)
+		}
+		opts.Listeners, opts.VNCAuth = ls, auth
+		ev.emit("display", map[string]any{"width": disp.Width, "height": disp.Height, "vnc": urls})
+		reg.Update(func(e *registry.Entry) { e.VNC = urls })
+		if *eventsFD < 0 {
+			for _, u := range urls {
+				if auth.Password != "" {
+					fmt.Fprintf(os.Stderr, "[ksar] display %dx%d: %s (password %s)\n", disp.Width, disp.Height, u, auth.Password)
+				} else {
+					fmt.Fprintf(os.Stderr, "[ksar] display %dx%d: %s\n", disp.Width, disp.Height, u)
+				}
+			}
+		}
+	}
+	if policy != nil {
+		// Blocked attempts are worth seeing on the terminal; everything is
+		// in the event stream. Under the UI (events fd) stderr belongs to
+		// the guest, so nothing is printed there.
+		onEvent := func(e netproxy.Event) {
+			ev.emit("net", map[string]any{"net": e})
+			if *eventsFD < 0 && (*verbose || !e.Allowed) {
+				fmt.Fprintf(os.Stderr, "[ksar] net: %s\n", netproxy.FormatEvent(e))
+			}
+		}
+		if opts.Net, err = startNetProxy(*policy, *lockdown && !builtWithCgo, onEvent); err != nil {
+			return fail(err)
+		}
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[ksar] network: %s %v (guest %s, DNS %s)\n",
+				policy.Mode, policy.Allow, netproxy.GuestAddr, netproxy.DNSAddr)
+		}
 	}
 	if *lockdown && builtWithCgo {
 		return fail(errors.New("this ksar was built with cgo, which the seccomp lockdown does not support; " +
@@ -217,7 +370,10 @@ Flags:
 	}
 	opts.OnReady = func(boot time.Duration, cid uint32) {
 		ev.emit("ready", map[string]any{"boot_ms": boot.Milliseconds(), "cid": cid})
+		reg.Update(func(e *registry.Entry) { e.Status, e.CID = "running", cid })
 	}
+	opts.ID = vmID
+
 	defer func() {
 		removed := 0
 		for _, w := range []io.Writer{stdout, stderr, opts.Console} {
@@ -230,8 +386,40 @@ Flags:
 			fmt.Fprintf(os.Stderr, "ksar: removed %d terminal control sequence(s) from the guest's output (-raw keeps them)\n", removed)
 		}
 	}()
+	var saved sandbox.SaveResult
+	if *saveChanges != "" {
+		if !virtioMode || *image == "" {
+			return fail(errors.New("-save-changes needs -image and the Ksar kernel"))
+		}
+		// Opened now: lockdown forbids opening (or removing) files later.
+		f, err := os.Create(*saveChanges)
+		if err != nil {
+			return fail(err)
+		}
+		defer f.Close()
+		opts.SaveChanges, opts.SaveResult = f, &saved
+	}
+	if len(layerTars) > 0 && opts.RootDisk == "" {
+		return fail(errors.New("-layer needs -image and the Ksar kernel"))
+	}
 	code := runSandbox(opts, *verbose, *raw, *timeout, virtioMode, fail)
+	if *saveChanges != "" {
+		switch {
+		case saved.Saved:
+			if *verbose {
+				fmt.Fprintf(os.Stderr, "[ksar] saved %d changed files (%s) to %s\n", saved.Files, humanBytes(saved.Bytes), *saveChanges)
+			}
+		case saved.Err != nil:
+			fmt.Fprintf(os.Stderr, "ksar: saving changes failed: %v (%s is incomplete)\n", saved.Err, *saveChanges)
+			if code == 0 {
+				code = exitKsarError
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "ksar: changes not saved: the command failed (%s is empty)\n", *saveChanges)
+		}
+	}
 	ev.emit("exit", map[string]any{"code": code})
+	reg.Update(func(e *registry.Entry) { e.Status, e.ExitCode = "exited", &code })
 	return code
 }
 

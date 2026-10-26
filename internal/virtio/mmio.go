@@ -81,6 +81,13 @@ type Device interface {
 	Reset()
 }
 
+// ConfigWriter is implemented by devices whose config space the driver
+// may write (virtio-input selects what it reads that way). Others have a
+// read-only config space.
+type ConfigWriter interface {
+	WriteConfig(offset uint64, data []byte)
+}
+
 // Activation is what a device receives when the driver is ready.
 type Activation struct {
 	Mem      *Memory
@@ -171,8 +178,16 @@ func (m *MMIO) Read(offset uint64, data []byte) {
 
 // Write handles a guest store to the device's MMIO window.
 func (m *MMIO) Write(offset uint64, data []byte) {
-	if offset >= regConfig || len(data) != 4 {
-		return // config space is read-only; registers are 32-bit only
+	if offset >= regConfig {
+		if cw, ok := m.dev.(ConfigWriter); ok {
+			m.mu.Lock()
+			cw.WriteConfig(offset-regConfig, data)
+			m.mu.Unlock()
+		}
+		return
+	}
+	if len(data) != 4 {
+		return // registers are 32-bit only
 	}
 	v := binary.LittleEndian.Uint32(data)
 
@@ -332,6 +347,10 @@ func (m *MMIO) logf(format string, args ...any) {
 
 func deviceName(id uint32) string {
 	switch id {
+	case 1:
+		return "net"
+	case 18:
+		return "input"
 	case 2:
 		return "block"
 	case 19:

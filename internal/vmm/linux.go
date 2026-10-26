@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
 	"ksar/internal/boot"
 	"ksar/internal/devices"
+	"ksar/internal/display"
 	"ksar/internal/kvm"
 	"ksar/internal/virtio"
 )
@@ -59,6 +61,29 @@ type LinuxConfig struct {
 	AgentChannel bool      // add COM2 as a byte stream to the guest agent
 	Disks        []Disk    // virtio-blk disks: /dev/vda, /dev/vdb, ... in order
 	Vsock        bool      // add a vhost-vsock device for the agent
+	Net          *Net      // add a virtio-net card (eth0) bridged to a backend
+	Display      *Display  // add a framebuffer, keyboard and tablet
+}
+
+// Display is the guest's screen size. The framebuffer is 32-bit xRGB.
+type Display struct {
+	Width, Height int
+}
+
+// MaxDisplay bounds the screen (the framebuffer must fit in the hole
+// between guest RAM and the virtio-mmio window).
+const MaxDisplayWidth, MaxDisplayHeight = 2560, 1600
+
+// fbBase is where the framebuffer sits: just above the largest possible
+// guest RAM (boot.MaxMemory), below mmioBase.
+const fbBase = 0xc0000000
+
+// Net is the guest's network card. Backend is a non-blocking
+// SOCK_SEQPACKET socket carrying one Ethernet frame per message; the
+// machine owns it once NewLinux is called.
+type Net struct {
+	Backend *os.File
+	MAC     [6]byte
 }
 
 // LinuxResult reports how a Linux guest run ended.
@@ -87,6 +112,8 @@ type Machine struct {
 	mmio   []mmioDevice
 	blocks []*virtio.Block
 	vsock  *virtio.Vsock
+	net    *virtio.Net
+	screen *display.Screen
 	agentL *agentListener
 	done   chan struct{} // closed when Run returns
 
@@ -148,11 +175,27 @@ func NewLinux(cfg LinuxConfig) (m *Machine, err error) {
 	if err != nil {
 		return nil, err
 	}
+	var fb *boot.Framebuffer
+	if d := cfg.Display; d != nil {
+		if d.Width < 320 || d.Height < 200 || d.Width > MaxDisplayWidth || d.Height > MaxDisplayHeight {
+			return nil, fmt.Errorf("display %dx%d: must be between 320x200 and %dx%d",
+				d.Width, d.Height, MaxDisplayWidth, MaxDisplayHeight)
+		}
+		fb = &boot.Framebuffer{Base: fbBase, Width: d.Width, Height: d.Height, Stride: d.Width * 4}
+		size := (fb.Stride*fb.Height + 4095) &^ 4095
+		fbMem, err := m.vm.AddMemory(1, fbBase, size)
+		if err != nil {
+			return nil, err
+		}
+		m.screen = &display.Screen{Width: d.Width, Height: d.Height, Stride: fb.Stride,
+			FB: fbMem[:fb.Stride*fb.Height], Name: "ksar",
+			Keyboard: virtio.NewInput(virtio.KeyboardSpec()), Tablet: virtio.NewInput(virtio.TabletSpec(d.Width, d.Height))}
+	}
 	cmdline, err := m.addVirtio(virtio.NewMemory(mem))
 	if err != nil {
 		return nil, err
 	}
-	entry, err := boot.Load(mem, boot.Linux{Kernel: cfg.Kernel, Initrd: cfg.Initrd, Cmdline: cmdline})
+	entry, err := boot.Load(mem, boot.Linux{Kernel: cfg.Kernel, Initrd: cfg.Initrd, Cmdline: cmdline, Framebuffer: fb})
 	if err != nil {
 		return nil, fmt.Errorf("load kernel: %w", err)
 	}
@@ -223,6 +266,21 @@ func (m *Machine) addVirtio(mem *virtio.Memory) (string, error) {
 			return "", err
 		}
 	}
+	if m.cfg.Net != nil {
+		m.net = virtio.NewNet(m.cfg.Net.Backend, m.cfg.Net.MAC)
+		if err := add(m.net); err != nil {
+			return "", err
+		}
+	}
+	if m.screen != nil {
+		for _, in := range []*virtio.Input{m.screen.Keyboard, m.screen.Tablet} {
+			if err := add(in); err != nil {
+				return "", err
+			}
+		}
+		// The screen stays blank until a program draws: no console cursor.
+		cmdline += " ksar.display=1 vt.global_cursor_default=0"
+	}
 	if m.cfg.Vsock {
 		v, err := virtio.NewVsock()
 		if err != nil {
@@ -239,6 +297,10 @@ func (m *Machine) addVirtio(mem *virtio.Memory) (string, error) {
 	}
 	return cmdline, nil
 }
+
+// Screen returns the display, or nil without one. Serve viewers with
+// its Serve method.
+func (m *Machine) Screen() *display.Screen { return m.screen }
 
 // GuestCID returns the VM's vsock context ID, or 0 without vsock.
 func (m *Machine) GuestCID() uint32 {
@@ -393,6 +455,12 @@ func (m *Machine) Close() error {
 	if m.vsock != nil {
 		errs = append(errs, m.vsock.Close())
 		m.vsock = nil
+	}
+	if m.net != nil {
+		errs = append(errs, m.net.Close())
+		m.net = nil
+	} else if m.cfg.Net != nil && m.cfg.Net.Backend != nil {
+		m.cfg.Net.Backend.Close() // NewLinux failed before the device existed
 	}
 	for _, b := range m.blocks {
 		errs = append(errs, b.Close())
