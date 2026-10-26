@@ -1,0 +1,22 @@
+Ksar
+Copyright 2026 Charif Yahia
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes software developed by others:
+
+- gVisor's network stack (gvisor.dev/gvisor), Copyright The gVisor Authors,
+  Apache License 2.0.
+- Go supplementary libraries (golang.org/x/net, golang.org/x/sys,
+  golang.org/x/time), Copyright The Go Authors, BSD 3-Clause License.
+- github.com/google/btree, Copyright Google Inc., Apache License 2.0.
+
+Not included, obtained separately:
+
+- The guest kernel is Linux, licensed under the GNU General Public License
+  version 2. Ksar's repository contains only its build configuration
+  (kernel/ksar.config) and script (kernel/build.sh); `make kernel` downloads
+  the Linux source from kernel.org and builds it.
+- The command assistant's model, SmolLM2-135M-Instruct by Hugging Face, is
+  licensed under the Apache License 2.0. It is downloaded from Hugging Face
+  on request and is not part of this repository.

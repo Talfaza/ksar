@@ -430,5 +430,6 @@ into errors instead of kills, for debugging only.
 
 ## License
 
-No license has been chosen yet, so all rights are reserved for now. If you'd
-like to use or contribute to Ksar, please open an issue.
+Ksar is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
+for the software it includes. The guest kernel it builds is Linux (GPLv2),
+downloaded and built from source by `make kernel`.
