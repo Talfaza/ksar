@@ -250,6 +250,9 @@ fresh RAM layer, so nothing one run writes is seen by the next.
 - Database passwords read from a project's `.env` appear in its command, and
   so in your local run history.
 
+Found a security problem? Please report it privately, as described in
+[SECURITY.md](SECURITY.md).
+
 Tested against hostile workloads, all contained: reaching the network, looking
 for host files and SSH keys, writing to the image, fork bombs and infinite
 loops, memory and disk exhaustion, kernel module loading, and terminal escape
