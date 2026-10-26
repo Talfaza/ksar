@@ -18,7 +18,7 @@ web page served on the user's own machine.
 | Timeout        | 60 s, then the VM is killed               | Longer or none                          |
 | Image          | Minimal Linux rootfs                      | Any image (e.g. built from Docker images) |
 | Disk           | Read-only base + throwaway writable layer | Persistent disk                         |
-| Network        | **None**                                  | NAT, optional egress allowlist          |
+| Network        | **None** (no network card)                | Allow list of hosts, or the internet (public addresses), via a userspace proxy |
 | Display        | **None** (CLI only)                       | Framebuffer + virtio-input, or VNC      |
 | Files          | Only what the user sends in               | Extra input/output disks                |
 | Lifetime       | Destroyed after the run                   | Keep alive for multiple commands        |
@@ -40,7 +40,7 @@ Browser ──► http://127.0.0.1:PORT (token + Origin check)
 
 ## Build stages
 
-Status: stages 1-6 done.
+Status: stages 1-7 done; stage 8 (snapshots) shelved.
 
 1. ✅ **Hello guest** – KVM ioctls, map memory, run a tiny real-mode program,
    catch its port I/O via `KVM_EXIT_IO`.
@@ -82,7 +82,7 @@ Status: stages 1-6 done.
      controls are removed. Pipes/files untouched; -raw disables.
    - Not done: Landlock (per-thread, can't cover Go's existing threads),
      namespaces (would need a separate VMM process).
-6. ✅ **Local web UI** – embedded UI, xterm.js terminal over WebSocket.
+6. ✅ **Local web UI** – embedded UI with its own terminal renderer over SSE.
    `ksar ui`: server on 127.0.0.1 (Host check, startup token -> HttpOnly
    SameSite=Strict cookie, Origin check on mutations, CSP, no framing).
    Each run is a child `ksar run` (own lockdown + cgroup) reporting JSON
@@ -91,9 +91,61 @@ Status: stages 1-6 done.
    page embedded in the binary, guest output only via textContent.
    Screens: runs, new run, live run (terminal, kernel log, cgroup metrics,
    real protections), images (Docker import, cache), settings (checks).
-7. **Optional devices** – networking, then display (framebuffer + VNC/noVNC).
-8. **Snapshots** – save/restore memory + vCPU state for fast starts
-   (reseed guest RNG after restore).
+7. ✅ **Optional devices** – networking and display.
+   Networking: virtio-net in the VMM moves frames over a SOCK_SEQPACKET
+   socket pair to `ksar net-proxy`, a separate process (own seccomp
+   filter, same cgroup, Pdeathsig) running gVisor netstack in promiscuous
+   mode. TCP is terminated there and re-dialed from the host after the
+   policy check; DNS (10.0.2.3) is answered there, filtered by name, with
+   private answers dropped. `allow` mode only permits addresses its own
+   DNS returned for allowed names. Private/local/metadata ranges and the
+   host's own addresses are blocked unless named by an address rule. The
+   guest is configured by the kernel (`ip=`, CONFIG_IP_PNP); the agent
+   copies /proc/net/pnp to /etc/resolv.conf. gVisor is pinned at
+   ace9117eb232 (newer snapshots need Go 1.27 or carry a broken test file).
+   Display: a linear framebuffer in a second KVM memory slot at 3 GiB
+   (above the largest RAM, below virtio-mmio), announced in boot_params'
+   screen_info as a VESA LFB (xRGB8888) and driven by simpledrm (sysfb),
+   with fbdev emulation for /dev/fb0 and a VT for Xorg. Keyboard and
+   tablet are virtio-input (host -> guest events only; the status queue
+   is drained and ignored; config space is select/subsel driven, the one
+   writable config space). internal/display serves RFB 3.8 from the
+   framebuffer: Raw encoding, any true-color pixel format, tile-diffed
+   against a per-viewer shadow copy, VNC auth over TCP, clipboard
+   dropped. Listeners open before lockdown; the VMM filter gained
+   getsockname and setsockopt(TCP_NODELAY) only. The agent writes an
+   xorg.conf.d snippet naming the event devices (no udev) and defaults
+   DISPLAY=:0. The web UI bridges a WebSocket (Origin checked) to a
+   private Unix socket per run and draws with its own RFB client
+   (vnc.js). Tested with xterm/twm and XFCE on Alpine
+   (examples/desktop).
+   Desktops for any image (`-desktop`, the UI's default for display
+   runs): internal/desktop inspects the tar (os-release, Xorg, XFCE) and,
+   if needed, installs a minimal XFCE with the distro's package manager
+   (Alpine, Debian, Ubuntu, Fedora, Arch) in a Ksar VM whose network
+   reaches only that distro's mirrors. The agent exports the overlay's
+   upper dir (os.Root opened before switch_root; whiteouts and the
+   opaque/capability xattrs kept) as a tar (`-save-changes`, protocol
+   Export/ExportData); it is cached per image and stacked read-only at
+   run time (`-layer`, agent `ksar.layers=`, multi-lower overlay). The
+   tmpfs upper may now use 85% of RAM.
+   VM ids: every ksar run has an id (random or -id), registered in
+   $XDG_RUNTIME_DIR/ksar/vms/<id>.json (internal/registry). The entry is
+   opened before lockdown and rewritten in place with pwrite (fixed
+   8 KiB, space padded), since lockdown forbids creating, truncating or
+   deleting files; readers drop entries whose PID is gone or reused
+   (start time in /proc/PID/stat). ksar ps / ksar stop (prefix match,
+   SIGTERM then SIGKILL); SIGTERM/SIGINT are caught to record the exit.
+   The id names the cgroup scope, is passed through the scope re-exec,
+   and reaches the guest as /run/ksar/id. The UI passes its run id.
+8. **Snapshots** – shelved. A working version (boot ~520 ms -> ~20 ms for
+   runs without network or display: port-I/O snapshot point in the agent,
+   full vCPU/VM/device/RAM save under lockdown, copy-on-write restore,
+   vsock transport reset, TSC/kvmclock catch-up, RNG reseed) was built on
+   2026-10-22 and removed the same day as not worth its weight yet. The
+   code is archived in build/attic/snapshots-feature-2026-10-22.tar.gz.
+   Kept from it: the Hello message (VM id + entropy reseed at the start of
+   every run).
 
 ## Security rules
 
@@ -135,8 +187,9 @@ VMM round trips on queue kicks.
 - Fixed: copying a whole directory in: -copy DIR and UI "Add folder" stream a
   tar (TarOpen/Data/Close) packed before lockdown into an unlinked temp
   file; symlinks never followed, special files skipped.
-- Open: projects whose `npm test` runs lint hooks needing git; images must
-  contain every tool a test script calls (no network to fetch them).
+- Open: projects whose `npm test` runs lint hooks needing git.
+- Fixed: images had to contain every tool a test script calls -> optional
+  networking, e.g. `-net allow -allow pypi.org,files.pythonhosted.org`.
 
 ## Scope decisions
 
